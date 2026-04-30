@@ -16,9 +16,9 @@ Programmatic access to **ChatGPT (incl. Pro)** from Node, by translating between
 ## Install
 
 ```bash
-pnpm add @steipete/rosetta
+pnpm add @syntaxsmith/rosetta
 # or
-npm i @steipete/rosetta
+npm i @syntaxsmith/rosetta
 ```
 
 Requires Node ≥ 22.
@@ -88,7 +88,7 @@ Common flags: `--port <n>` (default 9222), `--host <h>` (default 127.0.0.1), `--
 ## Programmatic API
 
 ```ts
-import { openSession, runConversation } from "@steipete/rosetta";
+import { openSession, runConversation } from "@syntaxsmith/rosetta";
 
 const session = await openSession({ port: 9222 });
 
@@ -209,7 +209,7 @@ This way, Claude Code session A and Claude Code session B each spawn their own `
 Add via the CLI:
 
 ```bash
-claude mcp add rosetta -- npx -y @steipete/rosetta rosetta-mcp
+claude mcp add rosetta -- npx -y @syntaxsmith/rosetta rosetta-mcp
 ```
 
 Or hand-edit your global config (`~/.claude.json` on most platforms) and add:
@@ -219,7 +219,7 @@ Or hand-edit your global config (`~/.claude.json` on most platforms) and add:
   "mcpServers": {
     "rosetta": {
       "command": "npx",
-      "args": ["-y", "@steipete/rosetta", "rosetta-mcp"],
+      "args": ["-y", "@syntaxsmith/rosetta", "rosetta-mcp"],
       "env": {
         "ROSETTA_CDP_PORT": "9222"
       }
@@ -237,7 +237,7 @@ Edit `~/.codex/config.toml`:
 ```toml
 [mcp_servers.rosetta]
 command = "npx"
-args = ["-y", "@steipete/rosetta", "rosetta-mcp"]
+args = ["-y", "@syntaxsmith/rosetta", "rosetta-mcp"]
 
 [mcp_servers.rosetta.env]
 ROSETTA_CDP_PORT = "9222"
@@ -254,7 +254,7 @@ Open Cline's *MCP Servers* panel → *Edit MCP Settings*, then add:
   "mcpServers": {
     "rosetta": {
       "command": "npx",
-      "args": ["-y", "@steipete/rosetta", "rosetta-mcp"],
+      "args": ["-y", "@syntaxsmith/rosetta", "rosetta-mcp"],
       "env": { "ROSETTA_CDP_PORT": "9222" },
       "disabled": false,
       "autoApprove": ["consult"]   // optional: skip the per-call confirmation

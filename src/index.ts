@@ -1,5 +1,5 @@
 /**
- * @steipete/rosetta — Programmatic access to ChatGPT (incl. Pro) by
+ * @syntaxsmith/rosetta — Programmatic access to ChatGPT (incl. Pro) by
  * translating between an auth-holder Chrome page and a Node API.
  *
  * Public surface:
