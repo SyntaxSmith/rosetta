@@ -209,8 +209,10 @@ This way, Claude Code session A and Claude Code session B each spawn their own `
 Add via the CLI:
 
 ```bash
-claude mcp add rosetta -- npx -y @syntaxsmith/rosetta rosetta-mcp
+claude mcp add rosetta -- npx -y -p @syntaxsmith/rosetta rosetta-mcp
 ```
+
+> The `-p` flag is required: this package ships two bins (`rosetta`, `rosetta-mcp`) and without `-p` npx runs the same-named bin (`rosetta`) and treats `rosetta-mcp` as a CLI subcommand.
 
 Or hand-edit your global config (`~/.claude.json` on most platforms) and add:
 
@@ -219,7 +221,7 @@ Or hand-edit your global config (`~/.claude.json` on most platforms) and add:
   "mcpServers": {
     "rosetta": {
       "command": "npx",
-      "args": ["-y", "@syntaxsmith/rosetta", "rosetta-mcp"],
+      "args": ["-y", "-p", "@syntaxsmith/rosetta", "rosetta-mcp"],
       "env": {
         "ROSETTA_CDP_PORT": "9222"
       }
@@ -237,7 +239,7 @@ Edit `~/.codex/config.toml`:
 ```toml
 [mcp_servers.rosetta]
 command = "npx"
-args = ["-y", "@syntaxsmith/rosetta", "rosetta-mcp"]
+args = ["-y", "-p", "@syntaxsmith/rosetta", "rosetta-mcp"]
 
 [mcp_servers.rosetta.env]
 ROSETTA_CDP_PORT = "9222"
@@ -254,7 +256,7 @@ Open Cline's *MCP Servers* panel → *Edit MCP Settings*, then add:
   "mcpServers": {
     "rosetta": {
       "command": "npx",
-      "args": ["-y", "@syntaxsmith/rosetta", "rosetta-mcp"],
+      "args": ["-y", "-p", "@syntaxsmith/rosetta", "rosetta-mcp"],
       "env": { "ROSETTA_CDP_PORT": "9222" },
       "disabled": false,
       "autoApprove": ["consult"]   // optional: skip the per-call confirmation
