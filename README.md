@@ -173,16 +173,31 @@ rosetta ships an MCP server (`rosetta-mcp` binary) that speaks Model Context Pro
 
 ```
 consult({
-  prompt:           string,           // required
-  pro?:             boolean,          // use gpt-5-5-pro
-  model?:           string,           // explicit slug (overrides `pro`)
-  recall?:          boolean | string, // persist + reuse conversation
-  conversationId?:  string,           // continue explicit conversation
-  parentMessageId?: string,           // branch from a specific message
+  prompt:           string,  // required
+  pro?:             boolean, // use gpt-5-5-pro
+  model?:           string,  // explicit slug (overrides `pro`)
+  fresh?:           boolean, // start a new conversation (see "Conversation model" below)
+  recall?:          string,  // disk-persisted named thread (cross-session)
+  conversationId?:  string,  // continue an explicit conversation by id
+  parentMessageId?: string,  // branch from a specific message id
 }) → assistant text
 ```
 
-Configuration via env vars (set in your host's MCP config block):
+### Conversation model
+
+**Each `rosetta-mcp` process IS one conversation by default.** Two `consult` calls in a row from the same MCP session continue the same chatgpt.com conversation — multi-turn context retained automatically. Process exit (host shutdown, restart) = clean slate.
+
+| You want… | What to pass |
+|---|---|
+| Continue this session's conversation (default) | nothing — just `{prompt}` |
+| Start a new conversation (like clicking *New chat*) | `fresh: true` |
+| Long-lived context that survives MCP restarts | `recall: "research-on-X"` |
+| Reset a long-lived context | `fresh: true, recall: "research-on-X"` |
+| Continue an arbitrary existing conversation | `conversationId: "<id>"` |
+
+This way, Claude Code session A and Claude Code session B each spawn their own `rosetta-mcp` process and their conversations stay isolated automatically — no thread-naming required from the AI.
+
+### Configuration via env
 
 | Variable | Default | Purpose |
 |---|---|---|
