@@ -39,8 +39,14 @@ export type {
   SseEvent,
   SseMessageFrame,
   SsePatchFrame,
+  Attachment,
 } from "./types.js";
 export {
   parseConversationSse,
   aggregateAssistantMessage,
+  stripCitations,
 } from "./sse.js";
+export {
+  RosettaUploadError,
+  MAX_DATA_TRANSFER_BYTES,
+} from "./upload.js";

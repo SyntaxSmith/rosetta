@@ -119,7 +119,7 @@ export async function aggregateAssistantMessage(
   }
 
   return {
-    text: state.fullText,
+    text: stripCitations(state.fullText),
     conversationId: state.conversationId ?? "",
     messageId: state.messageId ?? "",
     modelSlug: state.modelSlug,
@@ -127,6 +127,20 @@ export async function aggregateAssistantMessage(
     tookMs: Date.now() - startedAtMs,
     eventCount: state.eventCount,
   };
+}
+
+/**
+ * ChatGPT wraps in-text citations in private-use Unicode markers:
+ * `U+E200 <type> U+E202 <id> U+E201`. The wrapper chars normally render as
+ * invisible glyphs but the inner ids leak through as garbage like
+ * `fileciteturn0file0` whenever a renderer treats PUA as fallback text. The
+ * ids reference internal turn/file numbering we don't surface anywhere, so
+ * strip the whole wrapped sequence (plus one optional leading space so we
+ * don't leave a stray gap mid-sentence).
+ */
+export function stripCitations(text: string): string {
+  // U+E200 (start) ... U+E201 (end). Lazy match keeps adjacent citations separate.
+  return text.replace(/\s?\u{E200}[^\u{E201}]*\u{E201}/gu, "");
 }
 
 function applyEvent(event: Record<string, unknown>, state: AggregatorState): void {

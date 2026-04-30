@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import {
   aggregateAssistantMessage,
   parseConversationSse,
+  stripCitations,
 } from "../src/sse.js";
 
 function bodyFrom(chunks: string[]): AsyncIterable<Uint8Array> {
@@ -146,6 +147,42 @@ describe("aggregateAssistantMessage", () => {
     expect(result.eventCount).toBe(0);
   });
 
+  test("strips ChatGPT private-use citation markers from text", async () => {
+    // Format observed live (probed via xxd on a real attachment response):
+    // U+E200 + "filecite" + U+E202 + "turn0file0" + U+E201
+    const cite = "\u{E200}filecite\u{E202}turn0file0\u{E201}";
+    const body = bodyFrom([
+      `data: {"message":{"id":"m7","content":{"content_type":"text","parts":["PINEAPPLE-9824 ${cite}"]}}}\n\n`,
+      "data: [DONE]\n\n",
+    ]);
+    const result = await aggregateAssistantMessage(parseConversationSse(body));
+    expect(result.text).toBe("PINEAPPLE-9824");
+  });
+});
+
+describe("stripCitations", () => {
+  test("removes wrapped citation including a single leading space", () => {
+    const cite = "\u{E200}filecite\u{E202}turn0file0\u{E201}";
+    expect(stripCitations(`Hello world ${cite}`)).toBe("Hello world");
+  });
+
+  test("removes multiple citations without merging adjacent text", () => {
+    const a = "\u{E200}filecite\u{E202}turn0file0\u{E201}";
+    const b = "\u{E200}cite\u{E202}turn0search1\u{E201}";
+    expect(stripCitations(`First ${a} second ${b} third`)).toBe("First second third");
+  });
+
+  test("is a no-op for plain text", () => {
+    expect(stripCitations("nothing to strip here.")).toBe("nothing to strip here.");
+  });
+
+  test("strips a citation with no leading space", () => {
+    const cite = "\u{E200}filecite\u{E202}turn0file0\u{E201}";
+    expect(stripCitations(`word${cite}.`)).toBe("word.");
+  });
+});
+
+describe("aggregateAssistantMessage extras", () => {
   test("captures finish_details from cumulative metadata block", async () => {
     const body = bodyFrom([
       'data: {"message":{"id":"m6","content":{"content_type":"text","parts":["done"]},"metadata":{"finish_details":{"type":"max_tokens"}}}}\n\n',

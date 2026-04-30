@@ -38,6 +38,7 @@ Usage:
   rosetta run --model <slug> "<p>"     explicit model slug
   rosetta run --recall <thread> "<p>"  thread into a persistent context
   rosetta run --stream "<prompt>"      stream tokens to stdout as they arrive
+  rosetta run --attach <path> "<p>"    attach a local file (repeatable; PNG/PDF/CSV/...)
   rosetta threads                      list persisted recall threads
   rosetta forget <thread>              clear a thread's persisted state
   rosetta probe                        list models exposed to this account
@@ -102,6 +103,7 @@ async function cmdRun(args: string[]): Promise<void> {
       pro: { type: "boolean" },
       recall: { type: "string" },
       stream: { type: "boolean" },
+      attach: { type: "string", multiple: true },
     },
     allowPositionals: true,
   });
@@ -117,6 +119,7 @@ async function cmdRun(args: string[]): Promise<void> {
     : (values.model ?? "gpt-5-3");
   const recall = values.recall;
   const stream = values.stream;
+  const attachments = (values.attach ?? []).map((path) => ({ path }));
 
   const session = await openSession({ port, host });
   try {
@@ -128,6 +131,7 @@ async function cmdRun(args: string[]): Promise<void> {
         prompt,
         model,
         ...(recall ? { recall } : {}),
+        ...(attachments.length > 0 ? { attachments } : {}),
       },
       stream
         ? {

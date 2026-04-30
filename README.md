@@ -85,6 +85,11 @@ rosetta forget research
 
 # list models the account exposes
 rosetta probe
+
+# attach a local file (repeatable) — image, PDF, CSV, code, ...
+rosetta run --attach photo.png "What's in this image?"
+rosetta run --pro --attach report.pdf "Quote the third paragraph verbatim."
+rosetta run --attach a.csv --attach b.csv "Merge these and find duplicates."
 ```
 
 Common flags: `--port <n>` (default 9222), `--host <h>` (default 127.0.0.1), `--model <slug>`.
@@ -122,6 +127,25 @@ const r2 = await runConversation(
   { prompt: "What was the token I asked you to remember?", model: "gpt-5-3", recall: "demo" },
 );
 // r2.text === "BANANA-77"
+
+// File attachments — same UX as drag-dropping in the web composer.
+// Each file is fed into ChatGPT's hidden file input via DataTransfer
+// and the page's React pipeline handles the rest. 20 MB per-file cap.
+const r3 = await runConversation(session, {
+  prompt: "What color is this image?",
+  model: "gpt-5-3",
+  attachments: [{ path: "./fixtures/red-square.png" }],
+});
+
+// Multiple files (sequential, fail-fast) + Pro for harder tasks.
+await runConversation(session, {
+  prompt: "Cross-reference these two PDFs and list contradictions.",
+  model: "gpt-5-5-pro",
+  attachments: [
+    { path: "./paper-v1.pdf" },
+    { path: "./paper-v2.pdf" },
+  ],
+});
 
 await session.close();
 ```
@@ -177,13 +201,14 @@ rosetta ships an MCP server (`rosetta-mcp` binary) that speaks Model Context Pro
 
 ```
 consult({
-  prompt:           string,  // required
-  pro?:             boolean, // use gpt-5-5-pro
-  model?:           string,  // explicit slug (overrides `pro`)
-  fresh?:           boolean, // start a new conversation (see "Conversation model" below)
-  recall?:          string,  // disk-persisted named thread (cross-session)
-  conversationId?:  string,  // continue an explicit conversation by id
-  parentMessageId?: string,  // branch from a specific message id
+  prompt:           string,    // required
+  pro?:             boolean,   // use gpt-5-5-pro
+  model?:           string,    // explicit slug (overrides `pro`)
+  fresh?:           boolean,   // start a new conversation (see "Conversation model" below)
+  recall?:          string,    // disk-persisted named thread (cross-session)
+  conversationId?:  string,    // continue an explicit conversation by id
+  parentMessageId?: string,    // branch from a specific message id
+  attachments?:     string[],  // local file paths (PNG/PDF/CSV/...) — sequential upload, 20 MB per-file
 }) → assistant text
 ```
 
@@ -295,6 +320,7 @@ Run `pnpm build` in the rosetta repo first so `dist/` exists.
 ## Caveats
 
 - ChatGPT's wire shapes shift periodically. The implementation tracks the protocol as of **2026-04** (model picker hidden Pro under `gpt-5-5-pro`; bootstrap SSE emits `stream_handoff`; second-leg WS uses `encoded_item` chunks). Wire-shape regressions are caught by a captured-frame replay test.
+- **Attachments**: per-file 20 MB cap (DataTransfer payload, base64-encoded over CDP). Sequential — multiple files attach one at a time, fail-fast if any errors. Pro and instant models accept different file types (vision-only vs file-search-only); if you attach a type the current model doesn't support, the call fails with `upload-timeout` because the page never renders the chip.
 - Per-call tabs and the typing mutex assume one Chrome browser; for high concurrency consider multiple Chrome instances on different ports.
 - Soft-delete on cleanup keeps the conversation list clean; persisted recall threads opt out of soft-delete automatically.
 - Not affiliated with OpenAI. Use respectfully and within your account's terms of service.

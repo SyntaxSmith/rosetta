@@ -110,6 +110,14 @@ server.registerTool(
         .string()
         .optional()
         .describe("Branch from a specific message id (advanced)."),
+      attachments: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Local file paths to attach to the prompt (images, PDFs, CSVs, etc.). " +
+            "Each file is fed into ChatGPT's composer the same way drag-dropping in the web UI does. " +
+            "20 MB per-file cap. Sequential — fail-fast if any file errors.",
+        ),
     },
   },
   async (args) => {
@@ -150,6 +158,9 @@ server.registerTool(
       }
       if (args.conversationId) runInput.conversationId = args.conversationId;
       if (args.parentMessageId) runInput.parentMessageId = args.parentMessageId;
+      if (args.attachments && args.attachments.length > 0) {
+        runInput.attachments = args.attachments.map((p) => ({ path: p }));
+      }
 
       const result = await runConversation(cdp, runInput, {
         // Always keep the conversation alive — both named threads and the

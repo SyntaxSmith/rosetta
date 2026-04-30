@@ -61,6 +61,13 @@ export interface HttpResponse {
   headers: Record<string, string>;
 }
 
+export interface Attachment {
+  /** Absolute or cwd-relative path to a local file (e.g. PNG, PDF, CSV). */
+  path: string;
+  /** Optional MIME-type override. Sniffed from extension if omitted. */
+  mimeType?: string;
+}
+
 export interface RunConversationInput {
   prompt: string;
   /** ChatGPT server-side slug, e.g. "gpt-5-5-pro". */
@@ -80,6 +87,13 @@ export interface RunConversationInput {
    * persisted for the next call.
    */
   recall?: boolean | string;
+  /**
+   * Local files to attach to this prompt. Uploaded to ChatGPT before the
+   * prompt is typed, same UX as drag-dropping a file in the web composer.
+   * Sequential per-call: each file is fed in order, attachment must confirm
+   * ready before the next one starts. Per-file size cap: 20 MB.
+   */
+  attachments?: Attachment[];
 }
 
 export interface RunConversationResult {

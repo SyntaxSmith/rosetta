@@ -13,6 +13,7 @@ import type {
   HttpResponse,
   ModelsResponse,
 } from "./types.js";
+import { attachFiles } from "./upload.js";
 
 export class RosettaRequestError extends Error {
   constructor(
@@ -357,6 +358,13 @@ async function runConversationInTab(
   }
 
   try {
+    if (input.attachments && input.attachments.length > 0) {
+      // Files first, then prompt. Each attachment is fed into the page's
+      // hidden file input via DataTransfer; we wait for the chip to render
+      // before moving on. Sequential — ChatGPT's React pipeline assigns each
+      // change event its own slot. See src/upload.ts.
+      await attachFiles(client.Runtime, input.attachments);
+    }
     await driveComposerSend(client, input.prompt);
     const result = await completion;
     const shouldKeep =
@@ -638,8 +646,12 @@ async function driveComposerSendInner(
 
   // Step 2: click send when the button is enabled. React may need a beat
   // after our InputEvent before the send button transitions from disabled
-  // to enabled, so poll for ~3s.
-  const clickDeadline = Date.now() + 3_000;
+  // to enabled. Plain-text turns clear in <1 s; attachment turns can take
+  // longer because the page enables send only once server-side processing
+  // of every uploaded file has caught up. 15 s covers both comfortably —
+  // we only wait the full window if the button is genuinely stuck.
+  const clickDeadline = Date.now() + 15_000;
+  let lastState: string | undefined;
   while (Date.now() < clickDeadline) {
     const r = await Runtime.evaluate({
       expression: `(() => {
@@ -657,11 +669,12 @@ async function driveComposerSendInner(
       returnByValue: true,
     });
     const v = r.result?.value as { state: string } | undefined;
+    if (v?.state) lastState = v.state;
     if (v?.state === "clicked") return;
     await new Promise<void>((resolve) => setTimeout(resolve, 150));
   }
   throw new RosettaRequestError(
-    "Send button never became enabled after typing",
+    `Send button never became enabled after typing (last observed state: ${lastState ?? "unknown"})`,
     0,
     undefined,
     "trigger-failed",
