@@ -1,0 +1,61 @@
+{
+  "name": "@steipete/rosetta",
+  "version": "0.1.0",
+  "description": "Programmatic access to ChatGPT Pro by translating between the auth-holder Chrome page and a Node API. Hijacks /backend-api/f/conversation via CDP Fetch.requestPaused, follows the WS second leg for Pro CoT, returns aggregated text + supports multi-turn / recall / streaming.",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "bin": {
+    "rosetta": "./dist/bin/rosetta.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/src/index.js",
+      "types": "./dist/src/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "pnpm build && pnpm test"
+  },
+  "dependencies": {
+    "chrome-remote-interface": "^0.33.3"
+  },
+  "devDependencies": {
+    "@types/chrome-remote-interface": "^0.33.0",
+    "@types/node": "^22.0.0",
+    "devtools-protocol": "^0.0.1621552",
+    "tsx": "^4.21.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "chatgpt",
+    "chatgpt-pro",
+    "openai",
+    "cdp",
+    "puppeteer",
+    "automation",
+    "websocket",
+    "sse"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SyntaxSmith/rosetta"
+  },
+  "homepage": "https://github.com/SyntaxSmith/rosetta",
+  "author": "SyntaxSmith"
+}

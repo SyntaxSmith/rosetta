@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.DS_Store
+*.tsbuildinfo
+.env
+.env.local
+*.log
+coverage/
+
+# scratch / debug helpers (keep local)
+scripts/_*.mjs
+scripts/_*.ts
