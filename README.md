@@ -1,5 +1,9 @@
 # rosetta
 
+<p align="center">
+  <img src="assets/promo.png" alt="rosetta — Pro web protocol ⇌ Node API" width="720">
+</p>
+
 Programmatic access to **ChatGPT (incl. Pro)** from Node, by translating between an auth-holder Chrome page and a clean API. 
 
 > Like the Rosetta Stone: the Pro web protocol on one side, a regular Node API on the other.
@@ -294,6 +298,16 @@ Run `pnpm build` in the rosetta repo first so `dist/` exists.
 - Per-call tabs and the typing mutex assume one Chrome browser; for high concurrency consider multiple Chrome instances on different ports.
 - Soft-delete on cleanup keeps the conversation list clean; persisted recall threads opt out of soft-delete automatically.
 - Not affiliated with OpenAI. Use respectfully and within your account's terms of service.
+
+## Acknowledgments
+
+rosetta descends from **[oracle](https://github.com/steipete/oracle)** — the
+predecessor that pioneered the auth-holder Chrome / CDP-orchestrator pattern
+this library extends to Pro thinking. The cross-platform `~/.rosetta/` profile
+convention, the `httpRequestViaChrome` shim that side-steps Cloudflare TLS
+fingerprinting, and the conversation soft-delete dance are all lifted directly
+from oracle's playbook. Thanks to that project for figuring out the hard parts
+first.
 
 ## License
 

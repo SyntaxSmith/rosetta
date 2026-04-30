@@ -10,3 +10,9 @@ coverage/
 # scratch / debug helpers (keep local)
 scripts/_*.mjs
 scripts/_*.ts
+
+# Claude Code agent guide (kept local)
+CLAUDE.md
+
+# image2 skill scratch outputs
+figures/ai_generated/
