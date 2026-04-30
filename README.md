@@ -1,6 +1,6 @@
 # rosetta
 
-Programmatic access to **ChatGPT (incl. Pro)** from Node, by translating between an auth-holder Chrome page and a clean API. The Pro thinking pipeline that the ChatGPT web UI uses — `/backend-api/f/conversation` plus the `conversation-turn-<id>` WebSocket second leg — is hijacked through CDP and exposed as a normal `runConversation()` call.
+Programmatic access to **ChatGPT (incl. Pro)** from Node, by translating between an auth-holder Chrome page and a clean API. 
 
 > Like the Rosetta Stone: the Pro web protocol on one side, a regular Node API on the other.
 
