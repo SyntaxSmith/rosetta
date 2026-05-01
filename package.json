@@ -1,6 +1,6 @@
 {
   "name": "@syntaxsmith/rosetta",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Programmatic access to ChatGPT Pro by translating between the auth-holder Chrome page and a Node API. Hijacks /backend-api/f/conversation via CDP Fetch.requestPaused, follows the WS second leg for Pro CoT, returns aggregated text + supports multi-turn / recall / streaming.",
   "type": "module",
   "main": "./dist/src/index.js",
