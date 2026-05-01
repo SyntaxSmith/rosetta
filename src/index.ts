@@ -13,6 +13,7 @@ export { openSession, RosettaAuthError, type Logger, type OpenSessionInput } fro
 export {
   runConversation,
   fetchAvailableModels,
+  closeAllOpenTabs,
   RosettaRequestError,
   type RunConversationOptions,
 } from "./client.js";

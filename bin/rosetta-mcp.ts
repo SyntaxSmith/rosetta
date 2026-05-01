@@ -37,6 +37,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import {
   clearThread,
+  closeAllOpenTabs,
   openSession,
   RosettaAuthError,
   RosettaRequestError,
@@ -214,5 +215,26 @@ server.registerTool(
     }
   },
 );
+
+// Close any tabs we opened on graceful shutdown so the user's Chrome
+// doesn't accumulate /c/<id> tabs from killed/restarted MCP sessions.
+// SIGKILL still leaks (no signal delivered), but Ctrl-C and SIGTERM are
+// covered. We snapshot the close-all promise on first signal so a second
+// signal can hard-exit without waiting.
+let __shuttingDown = false;
+function gracefulShutdown(signal: NodeJS.Signals): void {
+  if (__shuttingDown) {
+    process.exit(130);
+    return;
+  }
+  __shuttingDown = true;
+  closeAllOpenTabs()
+    .catch(() => undefined)
+    .finally(() => process.exit(signal === "SIGTERM" ? 143 : 130));
+  // Hard cap: if cleanup hangs, exit anyway after 3 s.
+  setTimeout(() => process.exit(signal === "SIGTERM" ? 143 : 130), 3_000).unref();
+}
+process.on("SIGINT", gracefulShutdown);
+process.on("SIGTERM", gracefulShutdown);
 
 await server.connect(new StdioServerTransport());

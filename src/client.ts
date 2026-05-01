@@ -549,21 +549,47 @@ async function withFreshTab<T>(
     url: "https://chatgpt.com/",
   });
   const targetId = created.targetId;
-  const tabClient = (await CDP({
-    port: session.meta.cdpPort,
-    host: session.meta.cdpHost ?? "127.0.0.1",
-    target: targetId,
-  })) as ChromeClient;
+  // Track the open tab so external shutdown handlers (SIGINT/SIGTERM) can
+  // close it if the process is killed before this finally runs.
+  __openTabs.add({ session, targetId });
+  let tabClient: ChromeClient | undefined;
   try {
+    // CDP attach is its own RPC — if it throws, we still need to close the
+    // already-created Target. Hence both the try entry and the assignment
+    // happen inside the try block.
+    tabClient = (await CDP({
+      port: session.meta.cdpPort,
+      host: session.meta.cdpHost ?? "127.0.0.1",
+      target: targetId,
+    })) as ChromeClient;
     // Wait for first load so the composer mount race is mostly resolved
     // before runConversationInTab kicks in.
     await tabClient.Page.enable();
     await waitForLoad(tabClient.Page);
     return await fn(tabClient);
   } finally {
-    await tabClient.close().catch(() => undefined);
+    if (tabClient) await tabClient.close().catch(() => undefined);
     await Target.closeTarget({ targetId }).catch(() => undefined);
+    for (const t of __openTabs) {
+      if (t.targetId === targetId) { __openTabs.delete(t); break; }
+    }
   }
+}
+
+/**
+ * Tabs created by `withFreshTab` that haven't yet hit their finally block.
+ * Exported (via the helper below) so a host process — typically the MCP
+ * server — can install a SIGINT/SIGTERM handler that closes them on
+ * graceful shutdown. SIGKILL still leaks (the process can't run code), but
+ * graceful exits + Ctrl-C are now leak-free.
+ */
+const __openTabs = new Set<{ session: RosettaSession; targetId: string }>();
+export async function closeAllOpenTabs(): Promise<void> {
+  const snapshot = Array.from(__openTabs);
+  __openTabs.clear();
+  await Promise.allSettled(
+    snapshot.map((t) => t.session.client.Target.closeTarget({ targetId: t.targetId })),
+  );
 }
 
 async function deleteConversation(
