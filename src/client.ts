@@ -13,7 +13,42 @@ import type {
   HttpResponse,
   ModelsResponse,
 } from "./types.js";
+import { appendFileSync as __dbgAppend, openSync as __dbgOpen, writeSync as __dbgWrite } from "node:fs";
 import { attachFiles } from "./upload.js";
+
+const DBG = !!process.env["ROSETTA_DEBUG"];
+const DBG_LOG = process.env["ROSETTA_DEBUG_LOG"];
+// Sentinel — fires unconditionally when DBG_LOG is set so we can prove
+// src/client.ts (vs dist/) is the loaded module. ESM-safe (uses imported fs).
+if (DBG_LOG) {
+  try {
+    __dbgAppend(
+      DBG_LOG,
+      `[rosetta-debug ${new Date().toISOString().slice(11, 23)} pid=${process.pid}] MODULE-INIT src/client.ts loaded (DBG=${DBG})\n`,
+    );
+  } catch { /* swallow */ }
+}
+let _dbgFd: number | undefined;
+const dbg = (label: string, extra?: unknown): void => {
+  if (!DBG) return;
+  const ts = new Date().toISOString().slice(11, 23);
+  let line: string;
+  if (extra === undefined) {
+    line = `[rosetta-debug ${ts} pid=${process.pid}] ${label}\n`;
+  } else {
+    let s: string;
+    try { s = typeof extra === "string" ? extra : JSON.stringify(extra); }
+    catch { s = String(extra); }
+    line = `[rosetta-debug ${ts} pid=${process.pid}] ${label} ${s}\n`;
+  }
+  process.stderr.write(line);
+  if (DBG_LOG) {
+    try {
+      if (_dbgFd === undefined) _dbgFd = __dbgOpen(DBG_LOG, "a");
+      __dbgWrite(_dbgFd, line);
+    } catch { /* swallow */ }
+  }
+};
 
 export class RosettaRequestError extends Error {
   constructor(
@@ -172,13 +207,26 @@ async function runConversationInTab(
   // caller explicitly threads a conversation (multi-turn case) — for a fresh
   // tab we still need to navigate to the conversation URL so the page is on
   // the right state.
+  dbg("runConversationInTab enter", {
+    convId: input.conversationId, parentMsgId: input.parentMessageId,
+    model: input.model, promptLen: input.prompt.length,
+    hasAttachments: !!input.attachments?.length,
+  });
   if (input.conversationId) {
+    dbg("Page.navigate /c/<id> begin");
+    const navStart = Date.now();
     await Page.navigate({
       url: `https://chatgpt.com/c/${encodeURIComponent(input.conversationId)}`,
     });
+    dbg("Page.navigate /c/<id> done", { navMs: Date.now() - navStart });
+    const wlStart = Date.now();
     await waitForLoad(Page);
+    dbg("waitForLoad done", { waitMs: Date.now() - wlStart });
   } else {
+    dbg("navigateToFreshChat begin");
+    const fcStart = Date.now();
     await navigateToFreshChat(client);
+    dbg("navigateToFreshChat done", { ms: Date.now() - fcStart });
   }
   // Only intercept at the Request stage — we let the response flow back to
   // the page naturally so React's send-action state machine actually
@@ -190,6 +238,7 @@ async function runConversationInTab(
       { urlPattern: "*/backend-api/f/conversation", requestStage: "Request" },
     ],
   });
+  dbg("Fetch.enable done (pattern */backend-api/f/conversation)");
 
   let resolveResult: (r: RunConversationResult) => void;
   let rejectResult: (e: unknown) => void;
@@ -211,10 +260,14 @@ async function runConversationInTab(
     requestId: string;
     request: { url: string };
   }) => {
+    if (DBG && (e.request.url.includes("/backend-api/") || e.request.url.includes("ws.chatgpt.com"))) {
+      dbg("Network.requestWillBeSent", { id: e.requestId, claimed, url: e.request.url });
+    }
     if (!claimed) return;
     if (networkRequestId) return;
     if (e.request.url.endsWith("/backend-api/f/conversation")) {
       networkRequestId = e.requestId;
+      dbg("networkRequestId bound", { id: e.requestId });
     }
   };
 
@@ -222,6 +275,7 @@ async function runConversationInTab(
     requestId: string;
     request: { url: string; postData?: string; headers: Record<string, string> };
   }) => {
+    dbg("Fetch.requestPaused", { url: event.request.url, claimed, hasBody: !!event.request.postData });
     try {
       if (!event.request.url.endsWith("/backend-api/f/conversation")) {
         await Fetch.continueRequest({ requestId: event.requestId });
@@ -263,6 +317,7 @@ async function runConversationInTab(
     if (e.requestId !== networkRequestId) return;
     observedStatus = e.response.status;
     observedContentType = e.response.mimeType || "";
+    dbg("Network.responseReceived", { status: observedStatus, ct: observedContentType });
   };
   const onLoadingFinished = async (e: { requestId: string }) => {
     if (e.requestId !== networkRequestId) return;
@@ -321,6 +376,7 @@ async function runConversationInTab(
   };
   const onLoadingFailed = (e: { requestId: string; errorText: string }) => {
     if (e.requestId !== networkRequestId) return;
+    dbg("Network.loadingFailed", { err: e.errorText });
     rejectResult(
       new RosettaRequestError(
         `Network loading failed: ${e.errorText}`,
@@ -365,8 +421,54 @@ async function runConversationInTab(
       // change event its own slot. See src/upload.ts.
       await attachFiles(client.Runtime, input.attachments);
     }
+    dbg("driveComposerSend begin");
+    const dcsStart = Date.now();
     await driveComposerSend(client, input.prompt);
+    dbg("driveComposerSend done", { ms: Date.now() - dcsStart });
+
+    // Wait for the page to actually issue /backend-api/f/conversation —
+    // detected by `claimed` flipping when our Fetch.requestPaused fires.
+    //
+    // Why we need this: in multi-turn recall (when we navigate a fresh tab
+    // to /c/<existing-id>), ChatGPT's send pipeline almost always swallows
+    // the first send-button click. The click registers visually, the
+    // composer clears, but the page only fires /f/conversation/prepare and
+    // never /f/conversation. The send queue is then abandoned silently — no
+    // UI signal, no auto-retry — and `await completion` would sit until the
+    // wall-clock timeout. Observed empirically (2026-04-30): every recall
+    // turn after the first needed a redo. Suspected cause: the click lands
+    // before React's send-action handler is fully bound on the freshly
+    // hydrated tab; the prefetch /f/conversation/prepare dance has to finish
+    // first, ~6 s after page-boot.
+    //
+    // Workaround: if no /conversation request is intercepted within
+    // SEND_CLAIM_WAIT_MS, redo driveComposerSend (which re-types into the
+    // now-cleared composer and re-clicks). The second attempt is reliable.
+    const SEND_CLAIM_WAIT_MS = 6_000;
+    const SEND_MAX_ATTEMPTS = 3;
+    for (let attempt = 1; attempt < SEND_MAX_ATTEMPTS && !claimed; attempt++) {
+      const claimDeadline = Date.now() + SEND_CLAIM_WAIT_MS;
+      while (Date.now() < claimDeadline && !claimed) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 150));
+      }
+      if (claimed) break;
+      dbg("send swallowed — page never issued /f/conversation, retrying", { attempt });
+      await driveComposerSend(client, input.prompt);
+    }
+    if (!claimed) {
+      dbg("send still not claimed after retries — aborting fast (would otherwise hang)");
+      throw new RosettaRequestError(
+        `Send button click was registered but ChatGPT never issued /backend-api/f/conversation after ${SEND_MAX_ATTEMPTS} attempts. ` +
+          `This usually indicates a stuck send pipeline on a freshly-opened multi-turn Pro tab.`,
+        0,
+        undefined,
+        "trigger-failed",
+      );
+    }
+
+    dbg("await completion (waiting for /backend-api/f/conversation response)");
     const result = await completion;
+    dbg("completion resolved", { convId: result.conversationId, msgId: result.messageId, finish: result.finishReason });
     const shouldKeep =
       options.keepConversation ?? Boolean(input.conversationId);
     if (!shouldKeep && result.conversationId) {
@@ -567,6 +669,7 @@ async function driveComposerSendInner(
     }
     await new Promise<void>((resolve) => setTimeout(resolve, 150));
   }
+  dbg("focus poll exit", { hasFocus });
   if (!hasFocus) {
     throw new RosettaRequestError(
       "Could not bring tab to front (OS focus poll timed out)",
@@ -577,6 +680,7 @@ async function driveComposerSendInner(
   }
   // Now insertText reliably lands.
   await Input.insertText({ text: promptText });
+  dbg("Input.insertText done");
   // Verify; if not received, escalate to paste then textContent.
   const promptLiteral = JSON.stringify(promptText);
   const verifyDeadline = Date.now() + 1000;
@@ -594,7 +698,9 @@ async function driveComposerSendInner(
     if (observed.trim().length > 0) break;
     await new Promise<void>((resolve) => setTimeout(resolve, 100));
   }
+  dbg("verify after insertText", { observedLen: observed.length });
   if (observed.trim().length === 0) {
+    dbg("escalate to paste fallback");
     await Runtime.evaluate({
       expression: `(() => {
         const ce = document.querySelector('div#prompt-textarea, [contenteditable="true"]');
@@ -624,8 +730,10 @@ async function driveComposerSendInner(
       if (observed.trim().length > 0) break;
       await new Promise<void>((resolve) => setTimeout(resolve, 100));
     }
+    dbg("verify after paste", { observedLen: observed.length });
   }
   if (observed.trim().length === 0) {
+    dbg("escalate to textContent fallback");
     await Runtime.evaluate({
       expression: `(() => {
         const ce = document.querySelector('div#prompt-textarea, [contenteditable="true"]');
@@ -669,8 +777,9 @@ async function driveComposerSendInner(
       returnByValue: true,
     });
     const v = r.result?.value as { state: string } | undefined;
+    if (DBG && v?.state && v.state !== lastState) dbg("send-button state", v.state);
     if (v?.state) lastState = v.state;
-    if (v?.state === "clicked") return;
+    if (v?.state === "clicked") { dbg("send-button CLICKED"); return; }
     await new Promise<void>((resolve) => setTimeout(resolve, 150));
   }
   throw new RosettaRequestError(
@@ -794,6 +903,7 @@ async function streamSecondLeg(
   // we don't rely on page logic to subscribe. CDP fires events for both.
   let ourWsRequestId: string | undefined;
   const onCreated = (e: { requestId: string; url: string }) => {
+    dbg("Network.webSocketCreated", { id: e.requestId, url: e.url, alreadyClaimed: !!ourWsRequestId });
     if (!ourWsRequestId && e.url.includes("ws.chatgpt.com")) {
       ourWsRequestId = e.requestId;
     }
@@ -835,6 +945,7 @@ async function streamSecondLeg(
     if (!enc) return;
     queue.push(new TextEncoder().encode(enc));
   };
+  let dbgFrameCount = 0;
   const onFrameRecv = (e: {
     requestId: string;
     response: { payloadData: string };
@@ -842,6 +953,12 @@ async function streamSecondLeg(
     if (e.requestId !== ourWsRequestId) return;
     const payload = e.response.payloadData;
     if (!payload) return;
+    if (DBG) {
+      dbgFrameCount += 1;
+      if (dbgFrameCount <= 5 || dbgFrameCount % 50 === 0) {
+        dbg("WS frame", { n: dbgFrameCount, len: payload.length, head: payload.slice(0, 80) });
+      }
+    }
     // Any frame at all — including heartbeats, replies, and stream-items —
     // counts as liveness. Reset the idle clock here, before parsing, so that
     // even an unrecognized envelope still keeps the call alive.
@@ -966,6 +1083,7 @@ async function streamSecondLeg(
         return "ok";
       } catch (e) { return { __err: String(e) }; }
     })()`;
+    dbg("WS setup begin", { wsHost: new URL(wsUrl).host, topic: handoff.topicId });
     const setupRes = await Runtime.evaluate({
       expression: setupExpr,
       awaitPromise: true,
@@ -973,6 +1091,7 @@ async function streamSecondLeg(
     });
     const setupVal = setupRes.result?.value;
     if (setupVal && typeof setupVal === "object" && (setupVal as { __err: string }).__err) {
+      dbg("WS setup failed", setupVal);
       throw new RosettaRequestError(
         `WS setup failed: ${(setupVal as { __err: string }).__err}`,
         0,
@@ -980,6 +1099,7 @@ async function streamSecondLeg(
         "server",
       );
     }
+    dbg("WS setup ok (subscribed)");
 
     // 5. Aggregate the merged stream until termination, firing onChunk
     //    deltas live as the assistant message grows.
