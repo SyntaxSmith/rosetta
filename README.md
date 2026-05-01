@@ -319,7 +319,7 @@ Run `pnpm build` in the rosetta repo first so `dist/` exists.
 
 ## Caveats
 
-- ChatGPT's wire shapes shift periodically. The implementation tracks the protocol as of **2026-04** (model picker hidden Pro under `gpt-5-5-pro`; bootstrap SSE emits `stream_handoff`; second-leg WS uses `encoded_item` chunks). Wire-shape regressions are caught by a captured-frame replay test.
+- ChatGPT's wire shapes shift periodically. The implementation tracks the protocol as of **2026-05** (model picker hidden Pro under `gpt-5-5-pro`; bootstrap SSE emits `stream_handoff`; second-leg WS uses `encoded_item` chunks; send pipeline interleaves `/conversation/init`, `/f/conversation/prepare`, `/sentinel/chat-requirements`, autocompletions, and analytics before the actual `/f/conversation` POST — observed click-to-send latency commonly 15–25 s on multi-turn Pro, so we wait for `prepare` as the "click landed" signal rather than redoing). Wire-shape regressions are caught by a captured-frame replay test.
 - **Attachments**: per-file 20 MB cap (DataTransfer payload, base64-encoded over CDP). Sequential — multiple files attach one at a time, fail-fast if any errors. Pro and instant models accept different file types (vision-only vs file-search-only); if you attach a type the current model doesn't support, the call fails with `upload-timeout` because the page never renders the chip.
 - Per-call tabs and the typing mutex assume one Chrome browser; for high concurrency consider multiple Chrome instances on different ports.
 - Soft-delete on cleanup keeps the conversation list clean; persisted recall threads opt out of soft-delete automatically.

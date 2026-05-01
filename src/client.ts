@@ -233,12 +233,19 @@ async function runConversationInTab(
   // observes the SSE stream and clears itself. We capture our own copy via
   // Network.responseReceived + Network.getResponseBody after loadingFinished;
   // it's not live-streamed but it lets the page recover for the next turn.
+  //
+  // We intercept two URLs:
+  //   - `/backend-api/f/conversation`         — the actual send (rewrite + claim)
+  //   - `/backend-api/f/conversation/prepare` — pre-flight; pass through but
+  //     use it as a "send pipeline already started" signal so we don't
+  //     prematurely redo a click that's just slow.
   await Fetch.enable({
     patterns: [
       { urlPattern: "*/backend-api/f/conversation", requestStage: "Request" },
+      { urlPattern: "*/backend-api/f/conversation/prepare", requestStage: "Request" },
     ],
   });
-  dbg("Fetch.enable done (pattern */backend-api/f/conversation)");
+  dbg("Fetch.enable done (patterns: f/conversation + f/conversation/prepare)");
 
   let resolveResult: (r: RunConversationResult) => void;
   let rejectResult: (e: unknown) => void;
@@ -252,6 +259,12 @@ async function runConversationInTab(
   // /f/conversation flies per run, so the Network event for it is whichever
   // one fires after our Fetch.continueRequest.
   let claimed = false;
+  // `prepareSeen` flips when ChatGPT issues `/f/conversation/prepare` — that
+  // request reliably fires within 1–3 s of a successful click, well before
+  // `/f/conversation` itself (which can take 15+ s on multi-turn Pro with
+  // attachments). It's our "click landed, send pipeline is in flight" signal
+  // and is what guards against the redo loop misfiring on a slow prepare.
+  let prepareSeen = false;
   let networkRequestId: string | undefined;
   let observedStatus: number | undefined;
   let observedContentType = "";
@@ -277,6 +290,20 @@ async function runConversationInTab(
   }) => {
     dbg("Fetch.requestPaused", { url: event.request.url, claimed, hasBody: !!event.request.postData });
     try {
+      // Prepare is observation-only: pass through unmodified, just record
+      // that the send pipeline has started. This deliberately matches before
+      // the `/f/conversation` branch because the URL ends with `/prepare`
+      // (suffix-distinguishable) — but `endsWith("/conversation")` would
+      // wrongly match `/prepare` too if we're not careful, so we test
+      // prepare first.
+      if (event.request.url.endsWith("/backend-api/f/conversation/prepare")) {
+        if (!prepareSeen) {
+          prepareSeen = true;
+          dbg("prepare observed — send pipeline started");
+        }
+        await Fetch.continueRequest({ requestId: event.requestId });
+        return;
+      }
       if (!event.request.url.endsWith("/backend-api/f/conversation")) {
         await Fetch.continueRequest({ requestId: event.requestId });
         return;
@@ -429,37 +456,68 @@ async function runConversationInTab(
     // Wait for the page to actually issue /backend-api/f/conversation —
     // detected by `claimed` flipping when our Fetch.requestPaused fires.
     //
-    // Why we need this: in multi-turn recall (when we navigate a fresh tab
-    // to /c/<existing-id>), ChatGPT's send pipeline almost always swallows
-    // the first send-button click. The click registers visually, the
-    // composer clears, but the page only fires /f/conversation/prepare and
-    // never /f/conversation. The send queue is then abandoned silently — no
-    // UI signal, no auto-retry — and `await completion` would sit until the
-    // wall-clock timeout. Observed empirically (2026-04-30): every recall
-    // turn after the first needed a redo. Suspected cause: the click lands
-    // before React's send-action handler is fully bound on the freshly
-    // hydrated tab; the prefetch /f/conversation/prepare dance has to finish
-    // first, ~6 s after page-boot.
+    // The hard observation (verified 2026-05-01 by sniffing ChatGPT's send
+    // pipeline): from click-to-`/f/conversation` is ~15 s even for a trivial
+    // "ping" prompt because ChatGPT now interleaves /conversation/init,
+    // /f/conversation/prepare, /sentinel/chat-requirements, autocompletions,
+    // analytics. Multi-turn Pro with attachments easily exceeds 25 s. The
+    // earlier 6-s redo timeout (added 2026-04-30) was based on a wrong model
+    // and would fire while the pipeline was healthy — the redo's typing+click
+    // would either branch the conversation server-side OR hit the click loop
+    // when the button had already flipped to stop, raising no-button.
     //
-    // Workaround: if no /conversation request is intercepted within
-    // SEND_CLAIM_WAIT_MS, redo driveComposerSend (which re-types into the
-    // now-cleared composer and re-clicks). The second attempt is reliable.
-    const SEND_CLAIM_WAIT_MS = 6_000;
-    const SEND_MAX_ATTEMPTS = 3;
-    for (let attempt = 1; attempt < SEND_MAX_ATTEMPTS && !claimed; attempt++) {
-      const claimDeadline = Date.now() + SEND_CLAIM_WAIT_MS;
-      while (Date.now() < claimDeadline && !claimed) {
+    // Strategy: never redo unless we have *positive* evidence that the click
+    // was lost. Two independent signals say "click landed, just slow":
+    //   1. We saw `/f/conversation/prepare` go through (always fires within
+    //      ~3 s of a successful click).
+    //   2. The send button is no longer visible/enabled (it flipped to stop
+    //      or was unmounted). A click that was lost would leave the button
+    //      sitting there clickable.
+    // If either signal is true, we keep waiting. We only redo when both say
+    // "send button is right there waiting to be clicked again" AND we've
+    // exceeded SEND_BASE_WAIT_MS without any pipeline activity.
+    const SEND_BASE_WAIT_MS = 25_000;
+    const SEND_MAX_TOTAL_WAIT_MS = 120_000;
+    const SEND_REDO_LIMIT = 2;
+    const sendWaitStart = Date.now();
+    let redoCount = 0;
+    while (!claimed) {
+      const remainingTotal =
+        SEND_MAX_TOTAL_WAIT_MS - (Date.now() - sendWaitStart);
+      if (remainingTotal <= 0) break;
+      const stepDeadline =
+        Date.now() + Math.min(SEND_BASE_WAIT_MS, remainingTotal);
+      while (Date.now() < stepDeadline && !claimed) {
         await new Promise<void>((resolve) => setTimeout(resolve, 150));
       }
       if (claimed) break;
-      dbg("send swallowed — page never issued /f/conversation, retrying", { attempt });
+      const stillClickable = await isSendButtonStillClickable(client);
+      if (prepareSeen || !stillClickable) {
+        dbg("claim wait extended — pipeline in flight", {
+          prepareSeen,
+          stillClickable,
+          waitedMs: Date.now() - sendWaitStart,
+        });
+        continue;
+      }
+      if (redoCount >= SEND_REDO_LIMIT) {
+        dbg("redo limit reached without pipeline activity — giving up");
+        break;
+      }
+      redoCount++;
+      dbg("send appears truly swallowed — retyping", { redoCount });
       await driveComposerSend(client, input.prompt);
     }
     if (!claimed) {
-      dbg("send still not claimed after retries — aborting fast (would otherwise hang)");
+      dbg("send still not claimed after wait — aborting", {
+        prepareSeen,
+        redoCount,
+        waitedMs: Date.now() - sendWaitStart,
+      });
       throw new RosettaRequestError(
-        `Send button click was registered but ChatGPT never issued /backend-api/f/conversation after ${SEND_MAX_ATTEMPTS} attempts. ` +
-          `This usually indicates a stuck send pipeline on a freshly-opened multi-turn Pro tab.`,
+        `Send button click was registered but ChatGPT never issued /backend-api/f/conversation within ${Math.round(SEND_MAX_TOTAL_WAIT_MS / 1000)} s ` +
+          `(prepareSeen=${prepareSeen}, redos=${redoCount}). ` +
+          `This usually indicates a stuck send pipeline.`,
         0,
         undefined,
         "trigger-failed",
@@ -623,6 +681,32 @@ function rewriteBody(body: Record<string, unknown>, input: RunConversationInput)
   } else if (input.parentMessageId) {
     body.parent_message_id = input.parentMessageId;
   }
+}
+
+// Probe: is the send button currently visible AND enabled?
+// Returns false in three cases that all mean "click already landed,
+// the page is past the send-button stage":
+//   1. button removed from DOM (composer collapsed / replaced)
+//   2. button replaced by stop button (aria-label "Stop streaming response",
+//      data-testid="stop-button")
+//   3. button still there but disabled / aria-disabled
+// Returns true only when the button is still clickable — the only state
+// in which a redo is actually warranted.
+async function isSendButtonStillClickable(
+  client: RosettaSession["client"],
+): Promise<boolean> {
+  const r = await client.Runtime.evaluate({
+    expression: `(() => {
+      const btn = document.querySelector('button[data-testid="send-button"]') ||
+        Array.from(document.querySelectorAll('button[aria-label]'))
+          .find(b => /^send /i.test(b.getAttribute('aria-label') || ''));
+      if (!btn) return false;
+      if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
+      return true;
+    })()`,
+    returnByValue: true,
+  });
+  return r.result?.value === true;
 }
 
 // Global mutex for the focus-bound typing phase. Input.insertText and
@@ -807,6 +891,36 @@ async function driveComposerSendInner(
     if (v?.state) lastState = v.state;
     if (v?.state === "clicked") { dbg("send-button CLICKED"); return; }
     await new Promise<void>((resolve) => setTimeout(resolve, 150));
+  }
+  // Forensic dump on failure: capture composer + button-region DOM so the
+  // next failure can be diagnosed without re-running. Goes to stderr only
+  // (never to the returned error) so it doesn't leak into MCP responses.
+  try {
+    const dump = await Runtime.evaluate({
+      expression: `(() => {
+        const composer = document.querySelector('#prompt-textarea, [contenteditable="true"]');
+        let region = composer?.parentElement;
+        for (let i = 0; i < 6 && region && region.parentElement; i++) region = region.parentElement;
+        const buttons = region ? Array.from(region.querySelectorAll('button')).slice(0, 10).map(b => ({
+          testId: b.getAttribute('data-testid'),
+          aria: b.getAttribute('aria-label'),
+          disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
+          text: (b.textContent || '').trim().slice(0, 30),
+        })) : [];
+        return {
+          composerText: (composer?.textContent || '').slice(0, 200),
+          buttons,
+          regionHtmlHead: (region?.outerHTML || '').slice(0, 1500),
+        };
+      })()`,
+      returnByValue: true,
+    });
+    process.stderr.write(
+      `[rosetta] trigger-failed [no-button] forensic dump:\n` +
+        JSON.stringify(dump.result?.value, null, 2) + "\n",
+    );
+  } catch {
+    // ignore — best-effort diagnostics
   }
   throw new RosettaRequestError(
     `Send button never became enabled after typing (last observed state: ${lastState ?? "unknown"})`,
