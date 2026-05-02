@@ -262,9 +262,13 @@ async function runConversationInTab(
   // `prepareSeen` flips when ChatGPT issues `/f/conversation/prepare` — that
   // request reliably fires within 1–3 s of a successful click, well before
   // `/f/conversation` itself (which can take 15+ s on multi-turn Pro with
-  // attachments). It's our "click landed, send pipeline is in flight" signal
-  // and is what guards against the redo loop misfiring on a slow prepare.
+  // attachments). It's our "click landed, send pipeline started" signal —
+  // but on its own it does NOT rule out a swallowed send. The 7b54098 bug
+  // (multi-turn recall) is precisely "prepare fires, /f/conversation never
+  // does". We pair `prepareSeen` with a bounded grace (`PREPARE_GRACE_MS`)
+  // and the Stop-button probe so we can still redo after a stale prepare.
   let prepareSeen = false;
+  let prepareSeenAt: number | undefined;
   let networkRequestId: string | undefined;
   let observedStatus: number | undefined;
   let observedContentType = "";
@@ -299,6 +303,7 @@ async function runConversationInTab(
       if (event.request.url.endsWith("/backend-api/f/conversation/prepare")) {
         if (!prepareSeen) {
           prepareSeen = true;
+          prepareSeenAt = Date.now();
           dbg("prepare observed — send pipeline started");
         }
         await Fetch.continueRequest({ requestId: event.requestId });
@@ -456,56 +461,80 @@ async function runConversationInTab(
     // Wait for the page to actually issue /backend-api/f/conversation —
     // detected by `claimed` flipping when our Fetch.requestPaused fires.
     //
-    // The hard observation (verified 2026-05-01 by sniffing ChatGPT's send
-    // pipeline): from click-to-`/f/conversation` is ~15 s even for a trivial
-    // "ping" prompt because ChatGPT now interleaves /conversation/init,
-    // /f/conversation/prepare, /sentinel/chat-requirements, autocompletions,
-    // analytics. Multi-turn Pro with attachments easily exceeds 25 s. The
-    // earlier 6-s redo timeout (added 2026-04-30) was based on a wrong model
-    // and would fire while the pipeline was healthy — the redo's typing+click
-    // would either branch the conversation server-side OR hit the click loop
-    // when the button had already flipped to stop, raising no-button.
+    // Two failure modes we have to handle:
+    //   A. "Slow but legitimate": ChatGPT's send pipeline interleaves
+    //      /conversation/init, /f/conversation/prepare, /sentinel/chat-
+    //      requirements, autocompletions, analytics; click-to-
+    //      /f/conversation is commonly 15-25 s and can hit 30 s+ with
+    //      attachments. Button is in Stop state throughout.
+    //   B. "Swallowed click" (multi-turn recall, original 7b54098 bug):
+    //      click registers visually, /f/conversation/prepare fires, but
+    //      /f/conversation NEVER does. Composer clears, button flips to
+    //      Stop briefly then back to Send-but-disabled. No UI banner, no
+    //      auto-retry server-side.
     //
-    // Strategy: never redo unless we have *positive* evidence that the click
-    // was lost. Two independent signals say "click landed, just slow":
-    //   1. We saw `/f/conversation/prepare` go through (always fires within
-    //      ~3 s of a successful click).
-    //   2. The send button is no longer visible/enabled (it flipped to stop
-    //      or was unmounted). A click that was lost would leave the button
-    //      sitting there clickable.
-    // If either signal is true, we keep waiting. We only redo when both say
-    // "send button is right there waiting to be clicked again" AND we've
-    // exceeded SEND_BASE_WAIT_MS without any pipeline activity.
-    const SEND_BASE_WAIT_MS = 25_000;
+    // The 4eddae9 attempt to gate redos on `prepareSeen` failed for case
+    // (B): prepareSeen is true in BOTH cases, so trusting it as "pipeline
+    // in flight" forever means we never redo a swallowed click. The fix:
+    //   - Bound the post-prepare wait to PREPARE_GRACE_MS (35 s). Past
+    //     that, the prepare is stale enough that case (B) is the
+    //     overwhelmingly likely explanation.
+    //   - Gate redos on a Stop-button probe (only Stop indicates case A).
+    //     Send-disabled is exactly the case (B) signature, not a reason to
+    //     keep waiting.
+    //   - Reset prepareSeen on each redo so the grace clock restarts.
+    const SEND_BASE_WAIT_MS = 25_000;          // grace before redo when no prepare seen yet
+    const PREPARE_GRACE_MS = 35_000;           // grace after prepareSeen for /f/conversation to follow
     const SEND_MAX_TOTAL_WAIT_MS = 120_000;
     const SEND_REDO_LIMIT = 2;
+    const PROBE_INTERVAL_MS = 2_500;
     const sendWaitStart = Date.now();
     let redoCount = 0;
+    let lastProbeAt = 0;
     while (!claimed) {
-      const remainingTotal =
-        SEND_MAX_TOTAL_WAIT_MS - (Date.now() - sendWaitStart);
-      if (remainingTotal <= 0) break;
-      const stepDeadline =
-        Date.now() + Math.min(SEND_BASE_WAIT_MS, remainingTotal);
-      while (Date.now() < stepDeadline && !claimed) {
-        await new Promise<void>((resolve) => setTimeout(resolve, 150));
-      }
+      if (Date.now() - sendWaitStart >= SEND_MAX_TOTAL_WAIT_MS) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
       if (claimed) break;
-      const stillClickable = await isSendButtonStillClickable(client);
-      if (prepareSeen || !stillClickable) {
-        dbg("claim wait extended — pipeline in flight", {
+
+      // Should we even consider a redo yet?
+      let consider = false;
+      if (prepareSeen && prepareSeenAt !== undefined) {
+        if (Date.now() - prepareSeenAt > PREPARE_GRACE_MS) consider = true;
+      } else {
+        if (Date.now() - sendWaitStart > SEND_BASE_WAIT_MS) consider = true;
+      }
+      if (!consider) continue;
+
+      // Throttle the Stop-button probe; the inner sleep already polls
+      // `claimed` cheaply.
+      if (Date.now() - lastProbeAt < PROBE_INTERVAL_MS) continue;
+      lastProbeAt = Date.now();
+      const stopVisible = await isStopButtonVisible(client);
+      if (stopVisible) {
+        dbg("stop-button visible — pipeline genuinely in flight, keep waiting", {
           prepareSeen,
-          stillClickable,
           waitedMs: Date.now() - sendWaitStart,
         });
         continue;
       }
+
       if (redoCount >= SEND_REDO_LIMIT) {
-        dbg("redo limit reached without pipeline activity — giving up");
+        dbg("redo limit reached — giving up", {
+          prepareSeen,
+          redoCount,
+          waitedMs: Date.now() - sendWaitStart,
+        });
         break;
       }
       redoCount++;
-      dbg("send appears truly swallowed — retyping", { redoCount });
+      dbg("send appears swallowed — retyping", {
+        prepareSeen,
+        sincePrepareMs: prepareSeenAt ? Date.now() - prepareSeenAt : null,
+        redoCount,
+      });
+      // Reset so the next attempt's prepare resets the grace clock.
+      prepareSeen = false;
+      prepareSeenAt = undefined;
       await driveComposerSend(client, input.prompt);
     }
     if (!claimed) {
@@ -683,26 +712,21 @@ function rewriteBody(body: Record<string, unknown>, input: RunConversationInput)
   }
 }
 
-// Probe: is the send button currently visible AND enabled?
-// Returns false in three cases that all mean "click already landed,
-// the page is past the send-button stage":
-//   1. button removed from DOM (composer collapsed / replaced)
-//   2. button replaced by stop button (aria-label "Stop streaming response",
-//      data-testid="stop-button")
-//   3. button still there but disabled / aria-disabled
-// Returns true only when the button is still clickable — the only state
-// in which a redo is actually warranted.
-async function isSendButtonStillClickable(
+// Probe: is the *stop* button visible? This is the only DOM signal that
+// reliably means "a send pipeline is genuinely in flight". A naïve probe
+// based on the send button (`!enabled`) would conflate Stop with
+// Send-but-disabled — but Send-disabled is exactly the swallowed-click
+// signature (composer cleared, no pipeline running) and means we should
+// redo, not keep waiting.
+async function isStopButtonVisible(
   client: RosettaSession["client"],
 ): Promise<boolean> {
   const r = await client.Runtime.evaluate({
     expression: `(() => {
-      const btn = document.querySelector('button[data-testid="send-button"]') ||
+      const btn = document.querySelector('button[data-testid="stop-button"]') ||
         Array.from(document.querySelectorAll('button[aria-label]'))
-          .find(b => /^send /i.test(b.getAttribute('aria-label') || ''));
-      if (!btn) return false;
-      if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
-      return true;
+          .find(b => /^stop /i.test(b.getAttribute('aria-label') || ''));
+      return !!btn;
     })()`,
     returnByValue: true,
   });
