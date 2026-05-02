@@ -249,10 +249,23 @@ async function runConversationInTab(
 
   let resolveResult: (r: RunConversationResult) => void;
   let rejectResult: (e: unknown) => void;
+  // `completionSettled` mirrors the completion promise's state for the wait
+  // loop. The wait loop only checks `claimed`, so without this an early
+  // `rejectResult(err)` (e.g. `onPaused` threw because the page-issued body
+  // was empty or unparseable) gets queued silently — the loop keeps spinning
+  // until SEND_MAX_TOTAL_WAIT_MS, then throws the generic "stuck pipeline"
+  // error and the real cause is lost. With this flag the loop exits as
+  // soon as completion settles, and the subsequent `await completion`
+  // surfaces the actual error or result.
+  let completionSettled = false;
   const completion = new Promise<RunConversationResult>((resolve, reject) => {
     resolveResult = resolve;
     rejectResult = reject;
   });
+  completion.then(
+    () => { completionSettled = true; },
+    () => { completionSettled = true; },
+  );
 
   // Fetch.requestPaused requestIds and Network.* requestIds are NOT the same
   // namespace. We instead track the request by URL match: only one
@@ -491,10 +504,10 @@ async function runConversationInTab(
     const sendWaitStart = Date.now();
     let redoCount = 0;
     let lastProbeAt = 0;
-    while (!claimed) {
+    while (!claimed && !completionSettled) {
       if (Date.now() - sendWaitStart >= SEND_MAX_TOTAL_WAIT_MS) break;
       await new Promise<void>((resolve) => setTimeout(resolve, 250));
-      if (claimed) break;
+      if (claimed || completionSettled) break;
 
       // Should we even consider a redo yet?
       let consider = false;
@@ -537,7 +550,7 @@ async function runConversationInTab(
       prepareSeenAt = undefined;
       await driveComposerSend(client, input.prompt);
     }
-    if (!claimed) {
+    if (!claimed && !completionSettled) {
       dbg("send still not claimed after wait — aborting", {
         prepareSeen,
         redoCount,
