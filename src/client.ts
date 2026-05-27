@@ -4,6 +4,7 @@ import type { ChromeClient } from "./chrome.js";
 import {
   aggregateAssistantMessage,
   parseConversationSse,
+  stripCitations,
 } from "./sse.js";
 import { loadThread, resolveThreadName, saveThread } from "./state.js";
 import type {
@@ -1040,6 +1041,8 @@ async function streamSecondLeg(
 
   // 1. Get a fresh WS URL. The verify token has a TTL on the order of a
   // couple of hours, so we always re-fetch right before connecting.
+  // If this endpoint fails (or the URL it returns is unusable), we fall
+  // back to REST polling — see pollConversationForFinal.
   const wsResp = await session.httpRequest({
     method: "GET",
     url: "/backend-api/celsius/ws/user",
@@ -1047,20 +1050,16 @@ async function streamSecondLeg(
     responseType: "json",
   });
   if (wsResp.status < 200 || wsResp.status >= 300) {
-    throw new RosettaRequestError(
-      `Failed to get WS URL: HTTP ${wsResp.status}`,
-      wsResp.status,
-      typeof wsResp.body === "string" ? wsResp.body : JSON.stringify(wsResp.body),
-      "server",
+    dbg("celsius/ws/user failed — falling back to REST polling", { status: wsResp.status });
+    return await pollConversationForFinal(
+      session, handoff, startedAt, signal, idleTimeoutMs, onChunk,
     );
   }
   const wsUrl = (wsResp.body as { websocket_url?: string }).websocket_url;
   if (!wsUrl) {
-    throw new RosettaRequestError(
-      "celsius/ws/user response missing websocket_url",
-      0,
-      JSON.stringify(wsResp.body).slice(0, 400),
-      "server",
+    dbg("celsius/ws/user missing websocket_url — falling back to REST polling");
+    return await pollConversationForFinal(
+      session, handoff, startedAt, signal, idleTimeoutMs, onChunk,
     );
   }
 
@@ -1268,12 +1267,16 @@ async function streamSecondLeg(
     });
     const setupVal = setupRes.result?.value;
     if (setupVal && typeof setupVal === "object" && (setupVal as { __err: string }).__err) {
-      dbg("WS setup failed", setupVal);
-      throw new RosettaRequestError(
-        `WS setup failed: ${(setupVal as { __err: string }).__err}`,
-        0,
-        undefined,
-        "server",
+      // ChatGPT moved the Pro streaming endpoint behind a stricter handshake
+      // (2026-05) — `wss://ws.chatgpt.com/p2/ws/user/...` answers 403 even to
+      // the first-party page. The new messages ship `poll_interval_ms` and
+      // `poll_on_websocket_inactivity_ms` in metadata, so the supported
+      // recovery is to poll /backend-api/conversation/<id> until the final
+      // assistant text appears. Do that here so the call returns the answer
+      // instead of bubbling a ws-open error.
+      dbg("WS setup failed — falling back to REST polling", setupVal);
+      return await pollConversationForFinal(
+        session, handoff, startedAt, signal, idleTimeoutMs, onChunk,
       );
     }
     dbg("WS setup ok (subscribed)");
@@ -1299,6 +1302,165 @@ async function streamSecondLeg(
       } catch (_e) {} })()`,
     }).catch(() => undefined);
   }
+}
+
+/**
+ * Pro fallback: poll /backend-api/conversation/<id> until the assistant
+ * message for our turn finalizes, then return it as a RunConversationResult.
+ * Used when the page-side WebSocket can't open (ChatGPT's 2026-05 change made
+ * `wss://ws.chatgpt.com/p2/ws/user/...` reject every connection with 403, and
+ * the new server-side response now ships `poll_interval_ms` +
+ * `poll_on_websocket_inactivity_ms` in message metadata as the prescribed
+ * recovery).
+ *
+ * Termination signals (any of these resolves):
+ *   - an assistant descendant of our turn has content_type=text,
+ *     status=finished_successfully, end_turn=true
+ *   - caller AbortSignal aborts
+ *   - idleTimeoutMs elapses without forward progress (growing parts)
+ */
+type PollMessageNode = {
+  id: string;
+  message: {
+    id: string;
+    author?: { role?: string };
+    content?: { content_type?: string; parts?: unknown[] };
+    status?: string;
+    end_turn?: boolean | null;
+    metadata?: {
+      model_slug?: string;
+      turn_exchange_id?: string;
+      poll_interval_ms?: number;
+      finish_details?: { type?: string };
+    } & Record<string, unknown>;
+  } | null;
+};
+
+async function pollConversationForFinal(
+  session: RosettaSession,
+  handoff: StreamHandoff,
+  startedAt: number,
+  signal: AbortSignal | undefined,
+  idleTimeoutMs: number,
+  onChunk: ((delta: string) => void) | undefined,
+): Promise<RunConversationResult> {
+  // Default cadence; tightened toward server-advertised poll_interval_ms once
+  // we observe it on the assistant message metadata.
+  let intervalMs = 5_000;
+  let eventCount = 0;
+  let emittedLen = 0;
+  let lastProgressAt = Date.now();
+
+  dbg("poll fallback begin", {
+    convId: handoff.conversationId,
+    turn: handoff.turnExchangeId,
+    intervalMs,
+  });
+
+  while (true) {
+    if (signal?.aborted) {
+      throw new RosettaRequestError(
+        "Aborted while polling conversation",
+        0,
+        undefined,
+        "trigger-failed",
+      );
+    }
+    let resp;
+    try {
+      resp = await session.httpRequest({
+        method: "GET",
+        url: `/backend-api/conversation/${handoff.conversationId}`,
+        headers: { Authorization: `Bearer ${session.meta.accessToken}` },
+        responseType: "json",
+      });
+    } catch (err) {
+      dbg("poll fetch error", { err: String(err) });
+      await sleep(intervalMs, signal);
+      continue;
+    }
+    eventCount += 1;
+    if (resp.status === 200) {
+      const body = resp.body as { mapping?: Record<string, PollMessageNode> };
+      const mapping = body.mapping ?? {};
+      let finalNode: PollMessageNode["message"] | undefined;
+      let progressText = "";
+      for (const node of Object.values(mapping)) {
+        const m = node.message;
+        if (!m || m.author?.role !== "assistant") continue;
+        const tx = m.metadata?.turn_exchange_id;
+        if (handoff.turnExchangeId && tx && tx !== handoff.turnExchangeId) continue;
+        if (m.content?.content_type !== "text") continue;
+        const pim = m.metadata?.poll_interval_ms;
+        if (typeof pim === "number" && pim >= 1000 && pim < intervalMs) {
+          intervalMs = pim;
+        }
+        const parts = m.content?.parts;
+        const text = Array.isArray(parts) && typeof parts[0] === "string"
+          ? (parts[0] as string)
+          : "";
+        if (text.length > progressText.length) progressText = text;
+        if (m.status === "finished_successfully" && m.end_turn === true) {
+          finalNode = m;
+        }
+      }
+      if (progressText.length > emittedLen) {
+        if (onChunk) onChunk(progressText.slice(emittedLen));
+        emittedLen = progressText.length;
+        lastProgressAt = Date.now();
+      }
+      if (finalNode) {
+        const parts = finalNode.content?.parts;
+        const text = Array.isArray(parts) && typeof parts[0] === "string"
+          ? (parts[0] as string)
+          : "";
+        dbg("poll fallback done", {
+          msgId: finalNode.id,
+          textLen: text.length,
+          polls: eventCount,
+        });
+        return {
+          text: stripCitations(text),
+          conversationId: handoff.conversationId,
+          messageId: finalNode.id,
+          modelSlug: finalNode.metadata?.model_slug,
+          finishReason:
+            finalNode.metadata?.finish_details?.type ?? finalNode.status ?? "stop",
+          tookMs: Date.now() - startedAt,
+          eventCount,
+        };
+      }
+    } else if (resp.status === 404) {
+      // Conversation hasn't been persisted yet — keep polling briefly.
+      dbg("poll 404 — conversation not yet visible", { convId: handoff.conversationId });
+    } else {
+      dbg("poll non-200", { status: resp.status });
+    }
+    if (idleTimeoutMs > 0 && Date.now() - lastProgressAt > idleTimeoutMs) {
+      throw new RosettaRequestError(
+        `Polling timed out — no progress on conversation ${handoff.conversationId} for ${Math.round(idleTimeoutMs / 1000)} s`,
+        0,
+        undefined,
+        "server",
+      );
+    }
+    await sleep(intervalMs, signal);
+  }
+}
+
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise<void>((resolve) => {
+    let abortHandler: (() => void) | undefined;
+    const t = setTimeout(() => {
+      if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+      resolve();
+    }, ms);
+    if (signal) {
+      abortHandler = () => { clearTimeout(t); resolve(); };
+      signal.addEventListener("abort", abortHandler, { once: true });
+    }
+  });
 }
 
 /**
