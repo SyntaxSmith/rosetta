@@ -1324,6 +1324,8 @@ type PollMessageNode = {
   message: {
     id: string;
     author?: { role?: string };
+    recipient?: string;
+    create_time?: number;
     content?: { content_type?: string; parts?: unknown[] };
     status?: string;
     end_turn?: boolean | null;
@@ -1331,6 +1333,7 @@ type PollMessageNode = {
       model_slug?: string;
       turn_exchange_id?: string;
       poll_interval_ms?: number;
+      reasoning_status?: string;
       finish_details?: { type?: string };
     } & Record<string, unknown>;
   } | null;
@@ -1349,12 +1352,25 @@ async function pollConversationForFinal(
   let intervalMs = 5_000;
   let eventCount = 0;
   let emittedLen = 0;
+  let emittedNodeId: string | undefined;
+  let maxCtimeSeen = 0;
   let lastProgressAt = Date.now();
+
+  // Polling has no WS-heartbeat liveness — the only "progress" signal is a new
+  // turn node landing in the mapping. Pro routinely goes silent for 2+ minutes
+  // between the last `thoughts` node and the final `text` node (server
+  // assembles the answer before exposing it). The caller's idleTimeoutMs is
+  // sized for WS heartbeats (defaults to 90 s); apply a floor here so a
+  // legitimate Pro tail-silence isn't misread as a wedged connection.
+  const POLL_IDLE_FLOOR_MS = 6 * 60_000;
+  const effectiveIdleMs =
+    idleTimeoutMs > 0 ? Math.max(idleTimeoutMs, POLL_IDLE_FLOOR_MS) : 0;
 
   dbg("poll fallback begin", {
     convId: handoff.conversationId,
     turn: handoff.turnExchangeId,
     intervalMs,
+    effectiveIdleMs,
   });
 
   while (true) {
@@ -1383,49 +1399,126 @@ async function pollConversationForFinal(
     if (resp.status === 200) {
       const body = resp.body as { mapping?: Record<string, PollMessageNode> };
       const mapping = body.mapping ?? {};
-      let finalNode: PollMessageNode["message"] | undefined;
-      let progressText = "";
+
+      // Collect every assistant message that belongs to our turn. We deliberately
+      // walk the whole turn — not just `content_type=text` — because the
+      // *legitimate* completion signal lives on a non-text node: the
+      // `reasoning_recap` carries `metadata.reasoning_status === "reasoning_ended"`
+      // once Pro stops thinking. Earlier code returned on the first
+      // `text + end_turn=true` it found, which on Pro turns is a SHORT preamble
+      // node ("I'll first clarify…") emitted ~20–40 s in — minutes before the
+      // actual answer.
+      const turnNodes: Array<NonNullable<PollMessageNode["message"]>> = [];
+      let reasoningEnded = false;
       for (const node of Object.values(mapping)) {
         const m = node.message;
         if (!m || m.author?.role !== "assistant") continue;
         const tx = m.metadata?.turn_exchange_id;
         if (handoff.turnExchangeId && tx && tx !== handoff.turnExchangeId) continue;
-        if (m.content?.content_type !== "text") continue;
+        turnNodes.push(m);
         const pim = m.metadata?.poll_interval_ms;
         if (typeof pim === "number" && pim >= 1000 && pim < intervalMs) {
           intervalMs = pim;
         }
-        const parts = m.content?.parts;
-        const text = Array.isArray(parts) && typeof parts[0] === "string"
-          ? (parts[0] as string)
-          : "";
-        if (text.length > progressText.length) progressText = text;
-        if (m.status === "finished_successfully" && m.end_turn === true) {
-          finalNode = m;
+        if (m.metadata?.reasoning_status === "reasoning_ended") {
+          reasoningEnded = true;
         }
       }
-      if (progressText.length > emittedLen) {
-        if (onChunk) onChunk(progressText.slice(emittedLen));
-        emittedLen = progressText.length;
+
+      // Track the latest `content_type=text, recipient=all, end_turn=true,
+      // status=finished_successfully` node by create_time. On a Pro turn the
+      // first such node is the preamble; the second (≈minutes later) is the
+      // real answer. They share turn_exchange_id, so we pick by ctime.
+      let finalCandidate: NonNullable<PollMessageNode["message"]> | undefined;
+      for (const m of turnNodes) {
+        if (m.content?.content_type !== "text") continue;
+        if (m.recipient !== undefined && m.recipient !== "all") continue;
+        if (m.status !== "finished_successfully") continue;
+        if (m.end_turn !== true) continue;
+        if (
+          !finalCandidate ||
+          (m.create_time ?? 0) > (finalCandidate.create_time ?? 0)
+        ) {
+          finalCandidate = m;
+        }
+      }
+
+      // Stream progress: follow the current latest-text candidate. If the
+      // candidate id flips (preamble → real answer), reset the cursor so the
+      // caller sees the new text from its beginning rather than as a malformed
+      // delta computed against the preamble length.
+      if (finalCandidate) {
+        if (finalCandidate.id !== emittedNodeId) {
+          emittedNodeId = finalCandidate.id;
+          emittedLen = 0;
+        }
+        const parts = finalCandidate.content?.parts;
+        const text =
+          Array.isArray(parts) && typeof parts[0] === "string"
+            ? (parts[0] as string)
+            : "";
+        if (text.length > emittedLen) {
+          if (onChunk) onChunk(text.slice(emittedLen));
+          emittedLen = text.length;
+          lastProgressAt = Date.now();
+        }
+      }
+
+      // Liveness: any new turn node (thoughts, code, recap, …) counts as
+      // progress. Without this, a Pro turn that emits a 208-char preamble then
+      // 8 minutes of empty thoughts nodes would trip idleTimeoutMs (90 s by
+      // default) since `emittedLen` stops growing.
+      let maxCtimeThisPoll = 0;
+      for (const m of turnNodes) {
+        if (typeof m.create_time === "number" && m.create_time > maxCtimeThisPoll) {
+          maxCtimeThisPoll = m.create_time;
+        }
+      }
+      if (maxCtimeThisPoll > maxCtimeSeen) {
+        maxCtimeSeen = maxCtimeThisPoll;
         lastProgressAt = Date.now();
       }
-      if (finalNode) {
-        const parts = finalNode.content?.parts;
-        const text = Array.isArray(parts) && typeof parts[0] === "string"
-          ? (parts[0] as string)
-          : "";
+
+      // Termination signal: a `reasoning_recap` node has appeared with
+      // `metadata.reasoning_status === "reasoning_ended"` AND we have a final
+      // text candidate that's at least as new as every other node in the
+      // turn. We never enter this function except through `streamSecondLeg`,
+      // which fires only when the bootstrap SSE carried a `stream_handoff`
+      // event — and that handoff is Pro-only. Any cheaper "first text +
+      // end_turn=true → done" rule misfires on Pro: a *preamble* text node
+      // ("I'll first clarify…") lands 20–40 s in and satisfies it minutes
+      // before the actual answer.
+      let done = false;
+      if (finalCandidate && reasoningEnded) {
+        const candCtime = finalCandidate.create_time ?? 0;
+        let latestNonText = 0;
+        for (const m of turnNodes) {
+          if (m === finalCandidate) continue;
+          const t = m.create_time ?? 0;
+          if (t > latestNonText) latestNonText = t;
+        }
+        if (candCtime >= latestNonText) done = true;
+      }
+
+      if (done && finalCandidate) {
+        const parts = finalCandidate.content?.parts;
+        const text =
+          Array.isArray(parts) && typeof parts[0] === "string"
+            ? (parts[0] as string)
+            : "";
         dbg("poll fallback done", {
-          msgId: finalNode.id,
+          msgId: finalCandidate.id,
           textLen: text.length,
           polls: eventCount,
+          reasoningEnded,
         });
         return {
           text: stripCitations(text),
           conversationId: handoff.conversationId,
-          messageId: finalNode.id,
-          modelSlug: finalNode.metadata?.model_slug,
+          messageId: finalCandidate.id,
+          modelSlug: finalCandidate.metadata?.model_slug,
           finishReason:
-            finalNode.metadata?.finish_details?.type ?? finalNode.status ?? "stop",
+            finalCandidate.metadata?.finish_details?.type ?? finalCandidate.status ?? "stop",
           tookMs: Date.now() - startedAt,
           eventCount,
         };
@@ -1436,9 +1529,9 @@ async function pollConversationForFinal(
     } else {
       dbg("poll non-200", { status: resp.status });
     }
-    if (idleTimeoutMs > 0 && Date.now() - lastProgressAt > idleTimeoutMs) {
+    if (effectiveIdleMs > 0 && Date.now() - lastProgressAt > effectiveIdleMs) {
       throw new RosettaRequestError(
-        `Polling timed out — no progress on conversation ${handoff.conversationId} for ${Math.round(idleTimeoutMs / 1000)} s`,
+        `Polling timed out — no progress on conversation ${handoff.conversationId} for ${Math.round(effectiveIdleMs / 1000)} s`,
         0,
         undefined,
         "server",
