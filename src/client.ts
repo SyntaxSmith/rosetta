@@ -15,7 +15,7 @@ import type {
   ModelsResponse,
 } from "./types.js";
 import { appendFileSync as __dbgAppend, openSync as __dbgOpen, writeSync as __dbgWrite } from "node:fs";
-import { attachFiles } from "./upload.js";
+import { attachFiles, RosettaUploadError } from "./upload.js";
 
 const DBG = !!process.env["ROSETTA_DEBUG"];
 const DBG_LOG = process.env["ROSETTA_DEBUG_LOG"];
@@ -340,6 +340,17 @@ async function runConversationInTab(
         );
       }
       const body = JSON.parse(event.request.postData) as Record<string, unknown>;
+      // Correctness backstop: if the caller asked for attachments but the
+      // page-issued send carries no file reference, the upload silently failed
+      // to attach (see src/upload.ts). Fail loudly here rather than send a
+      // file-less message and have the model answer "I don't see a file".
+      if (input.attachments && input.attachments.length > 0 && !bodyHasAttachment(body)) {
+        throw new RosettaUploadError(
+          "Attachments were provided but the page-issued /f/conversation request carried no file reference — the upload did not attach to the message. The composer DOM or upload pipeline may have changed.",
+          "upload-failed",
+          input.attachments[0]!.path,
+        );
+      }
       rewriteBody(body, input);
       const newBody = JSON.stringify(body);
       const safeHeaders = Object.entries(event.request.headers)
@@ -465,7 +476,7 @@ async function runConversationInTab(
       // hidden file input via DataTransfer; we wait for the chip to render
       // before moving on. Sequential — ChatGPT's React pipeline assigns each
       // change event its own slot. See src/upload.ts.
-      await attachFiles(client.Runtime, input.attachments);
+      await attachFiles(client, input.attachments);
     }
     dbg("driveComposerSend begin");
     const dcsStart = Date.now();
@@ -710,6 +721,34 @@ async function deleteConversation(
     body: JSON.stringify({ is_visible: false }),
     responseType: "text",
   });
+}
+
+/**
+ * Does the outgoing /f/conversation body reference an uploaded file? ChatGPT
+ * carries file attachments as `messages[*].metadata.attachments[]` (PDFs/CSVs/
+ * docs) and images as asset-pointer parts in `messages[*].content.parts[]`.
+ * Used as a backstop: if the caller requested attachments but none of these are
+ * present, the in-page upload silently failed to attach and we must not send.
+ */
+function bodyHasAttachment(body: Record<string, unknown>): boolean {
+  const messages = (body as { messages?: unknown }).messages;
+  if (!Array.isArray(messages)) return false;
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    const meta = (m as { metadata?: { attachments?: unknown } }).metadata;
+    if (meta && Array.isArray(meta.attachments) && meta.attachments.length > 0) {
+      return true;
+    }
+    const parts = (m as { content?: { parts?: unknown } }).content?.parts;
+    if (Array.isArray(parts)) {
+      for (const p of parts) {
+        if (p && typeof p === "object" && "asset_pointer" in (p as object)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 function rewriteBody(body: Record<string, unknown>, input: RunConversationInput): void {

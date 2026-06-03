@@ -22,9 +22,27 @@ export interface ChromeClient {
       returnByValue?: boolean;
       awaitPromise?: boolean;
     }): Promise<{
-      result?: { value?: unknown };
+      // `objectId` is present when `returnByValue` is false and the expression
+      // evaluates to a non-primitive (e.g. a DOM element) — we use it to hand a
+      // node handle to `DOM.setFileInputFiles`. `subtype:"null"` distinguishes
+      // a real `null` (selector matched nothing) from an object handle.
+      result?: { value?: unknown; objectId?: string; subtype?: string };
       exceptionDetails?: { text: string };
     }>;
+  };
+  DOM: {
+    // Set files on an `<input type="file">` from real on-disk paths. This is
+    // the trusted, browser-native path (same as Playwright/Puppeteer
+    // `setInputFiles`) — it fires the `change` event ChatGPT's React composer
+    // actually consumes, unlike a hand-built DataTransfer + synthetic event.
+    // Pass the input element's `objectId` (from a `returnByValue:false`
+    // Runtime.evaluate) so we don't need DOM.getDocument.
+    setFileInputFiles(params: {
+      files: string[];
+      objectId?: string;
+      backendNodeId?: number;
+      nodeId?: number;
+    }): Promise<void>;
   };
   Network: {
     enable(params?: {
