@@ -294,19 +294,53 @@ async function runConversationInTab(
     if (DBG && (e.request.url.includes("/backend-api/") || e.request.url.includes("ws.chatgpt.com"))) {
       dbg("Network.requestWillBeSent", { id: e.requestId, claimed, url: e.request.url });
     }
-    if (!claimed) return;
     if (networkRequestId) return;
-    if (e.request.url.endsWith("/backend-api/f/conversation")) {
-      networkRequestId = e.requestId;
+    if (!e.request.url.endsWith("/backend-api/f/conversation")) return;
+    // Bind the response reader to this request id. In the happy path the Fetch
+    // stage already fired (`claimed === true`) and rewrote the body before this
+    // event; we just record the id so onResponseReceived/onLoadingFinished can
+    // read our copy of the SSE.
+    //
+    // The recovery path: occasionally Fetch.requestPaused never fires for
+    // `/f/conversation` (a CDP interception race after navigation, focus
+    // contention, or a body large enough that the Request-stage pause is
+    // skipped) even though the page genuinely issued the send and the model is
+    // already responding. Before, `claimed` stayed false forever, the send
+    // watchdog hit SEND_MAX_TOTAL_WAIT_MS, and we threw "never issued
+    // /f/conversation" — then tore down the tab, destroying a live generation.
+    // The Network layer still observes the request, so we bind it here even
+    // when unclaimed and let the normal instant/Pro completion path read the
+    // response. We lose the body rewrite (model / conversation_id / parent
+    // pinning), so warn loudly — but returning the answer beats a false
+    // timeout that kills the turn.
+    networkRequestId = e.requestId;
+    if (!claimed) {
+      dbg("networkRequestId bound WITHOUT Fetch claim — recovery path", { id: e.requestId });
+      process.stderr.write(
+        "[rosetta] WARNING: the page issued /backend-api/f/conversation but our " +
+          "Fetch interception never paused it; recovering the response without a " +
+          "body rewrite (model / conversation pinning skipped for this turn).\n",
+      );
+    } else {
       dbg("networkRequestId bound", { id: e.requestId });
     }
   };
 
   const onPaused = async (event: {
     requestId: string;
-    request: { url: string; postData?: string; headers: Record<string, string> };
+    request: {
+      url: string;
+      postData?: string;
+      hasPostData?: boolean;
+      headers: Record<string, string>;
+    };
   }) => {
-    dbg("Fetch.requestPaused", { url: event.request.url, claimed, hasBody: !!event.request.postData });
+    dbg("Fetch.requestPaused", {
+      url: event.request.url,
+      claimed,
+      hasBody: !!event.request.postData,
+      hasPostData: event.request.hasPostData,
+    });
     try {
       // Prepare is observation-only: pass through unmodified, just record
       // that the send pipeline has started. This deliberately matches before
@@ -331,13 +365,24 @@ async function runConversationInTab(
         await Fetch.continueRequest({ requestId: event.requestId });
         return;
       }
+      // CDP can omit the inline `postData` once a request body crosses an
+      // internal size threshold (it sets `hasPostData` instead), and the Fetch
+      // domain has no way to pull it back — `getRequestPostData` is a Network
+      // method keyed on a different requestId. Rather than hard-fail when we
+      // can't read the body, pass the request through unmodified and let the
+      // Network layer recover the response (the same recovery path used when a
+      // Fetch pause is missed entirely). We lose the body rewrite, so warn.
       if (!event.request.postData) {
-        throw new RosettaRequestError(
-          "Page-issued /f/conversation has no body to rewrite",
-          0,
-          undefined,
-          "trigger-failed",
+        dbg("/f/conversation paused without inline postData — passing through unrewritten", {
+          hasPostData: event.request.hasPostData,
+        });
+        process.stderr.write(
+          "[rosetta] WARNING: /backend-api/f/conversation body was not inlined by CDP " +
+            "(too large to read at the Fetch stage); sending it unmodified, so model / " +
+            "conversation pinning is skipped for this turn.\n",
         );
+        await Fetch.continueRequest({ requestId: event.requestId });
+        return;
       }
       const body = JSON.parse(event.request.postData) as Record<string, unknown>;
       // Correctness backstop: if the caller asked for attachments but the
@@ -516,10 +561,17 @@ async function runConversationInTab(
     const sendWaitStart = Date.now();
     let redoCount = 0;
     let lastProbeAt = 0;
-    while (!claimed && !completionSettled) {
+    // The watchdog's only job is to confirm the send actually went out. Either
+    // signal proves it: `claimed` (we intercepted + rewrote at the Fetch stage)
+    // OR `networkRequestId` (the Network layer saw /f/conversation leave, even
+    // if Fetch never paused it — the recovery path). Once either is set we stop
+    // watching for a swallowed click and hand off to `await completion`, whose
+    // progress is gated by idleTimeoutMs, not this 120 s click→send cap.
+    const sendInFlight = () => claimed || networkRequestId !== undefined;
+    while (!sendInFlight() && !completionSettled) {
       if (Date.now() - sendWaitStart >= SEND_MAX_TOTAL_WAIT_MS) break;
       await new Promise<void>((resolve) => setTimeout(resolve, 250));
-      if (claimed || completionSettled) break;
+      if (sendInFlight() || completionSettled) break;
 
       // Should we even consider a redo yet?
       let consider = false;
@@ -562,8 +614,8 @@ async function runConversationInTab(
       prepareSeenAt = undefined;
       await driveComposerSend(client, input.prompt);
     }
-    if (!claimed && !completionSettled) {
-      dbg("send still not claimed after wait — aborting", {
+    if (!sendInFlight() && !completionSettled) {
+      dbg("send never observed on the wire after wait — aborting", {
         prepareSeen,
         redoCount,
         waitedMs: Date.now() - sendWaitStart,
@@ -571,7 +623,7 @@ async function runConversationInTab(
       throw new RosettaRequestError(
         `Send button click was registered but ChatGPT never issued /backend-api/f/conversation within ${Math.round(SEND_MAX_TOTAL_WAIT_MS / 1000)} s ` +
           `(prepareSeen=${prepareSeen}, redos=${redoCount}). ` +
-          `This usually indicates a stuck send pipeline.`,
+          `The send was neither intercepted nor seen leave on the network — likely a stuck send pipeline or a page that never finished loading.`,
         0,
         undefined,
         "trigger-failed",

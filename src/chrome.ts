@@ -93,7 +93,12 @@ export interface ChromeClient {
     requestPaused(
       handler: (event: {
         requestId: string;
-        request: { url: string; postData?: string; headers: Record<string, string> };
+        request: {
+          url: string;
+          postData?: string;
+          hasPostData?: boolean;
+          headers: Record<string, string>;
+        };
         responseStatusCode?: number;
         responseHeaders?: Array<{ name: string; value: string }>;
       }) => void,
