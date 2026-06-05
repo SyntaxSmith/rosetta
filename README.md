@@ -269,6 +269,7 @@ Edit `~/.codex/config.toml`:
 [mcp_servers.rosetta]
 command = "npx"
 args = ["-y", "-p", "@syntaxsmith/rosetta", "rosetta-mcp"]
+tool_timeout_sec = 1800
 
 [mcp_servers.rosetta.env]
 ROSETTA_CDP_PORT = "9222"
