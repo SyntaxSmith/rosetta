@@ -808,12 +808,54 @@ function rewriteBody(body: Record<string, unknown>, input: RunConversationInput)
   // body.messages[0].content.parts is correct. We only override fields the
   // caller explicitly chose: model, conversation_id (multi-turn override),
   // parent_message_id (branching).
-  if (input.model) body.model = input.model;
+  if (process.env.ROSETTA_DEBUG_BODY) {
+    const clone = { ...body };
+    if (Array.isArray(clone.messages)) clone.messages = `[${clone.messages.length} msgs]`;
+    process.stderr.write(`\n[ROSETTA_DEBUG_BODY] page-produced body:\n${JSON.stringify(clone, null, 2)}\n`);
+  }
+  if (input.model) {
+    body.model = input.model;
+    alignThinkingEffort(body, input);
+  }
   if (input.conversationId) {
     if (!body.conversation_id) body.conversation_id = input.conversationId;
     if (input.parentMessageId) body.parent_message_id = input.parentMessageId;
   } else if (input.parentMessageId) {
     body.parent_message_id = input.parentMessageId;
+  }
+  if (process.env.ROSETTA_DEBUG_BODY) {
+    process.stderr.write(
+      `[ROSETTA_DEBUG_BODY] post-rewrite model=${String(body.model)} ` +
+        `thinking_effort=${"thinking_effort" in body ? String(body.thinking_effort) : "<removed>"}\n`,
+    );
+  }
+}
+
+// The 2026-06 GPT-5.5 composer carries a `thinking_effort` field in the
+// `/f/conversation` body, *separate* from the `model` slug — it encodes the
+// "智能水平" level (极速 / 均衡 / 高级 / 超高) and, for the **Pro** lane, a 标准 / 扩展
+// sub-menu. Captured: Pro 扩展 → `"extended"` (the depth we want as default);
+// Pro 标准 → `"standard"` (the lighter Pro depth — inferred, not yet captured).
+// The page builds the outgoing body from the account's composer default lane
+// (commonly Pro → `"extended"`), so pinning a different-lane model would leak that
+// effort and mismatch — e.g. a plain instant request inheriting Pro's extended
+// thinking (an instant `pong` measured 28s → 13s once stripped). Realign to the
+// pinned model's lane: Pro keeps `"extended"` (we default Pro to 扩展); everything
+// else drops the field so the backend applies that model's natural default
+// (matching the pre-5.5 wire shape, which had no `thinking_effort` at all). Override
+// via `input.thinkingEffort` — e.g. `"standard"` for Pro 标准.
+function alignThinkingEffort(body: Record<string, unknown>, input: RunConversationInput): void {
+  if (input.thinkingEffort !== undefined) {
+    body.thinking_effort = input.thinkingEffort;
+    return;
+  }
+  if (!("thinking_effort" in body)) return;
+  const model = input.model ?? "";
+  if (/-pro$/.test(model)) {
+    // Default the Pro lane to 扩展/extended (the deeper of Pro's 标准/扩展 sub-levels).
+    body.thinking_effort = "extended";
+  } else {
+    delete body.thinking_effort;
   }
 }
 

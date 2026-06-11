@@ -72,6 +72,15 @@ export interface RunConversationInput {
   prompt: string;
   /** ChatGPT server-side slug, e.g. "gpt-5-5-pro". */
   model: string;
+  /**
+   * Optional `thinking_effort` for the 2026-06 GPT-5.5 composer's "智能水平"
+   * selector. For the Pro lane this is the 标准 / 扩展 sub-level: "extended"
+   * (Pro 扩展, the default depth) or "standard" (Pro 标准). When omitted, the
+   * effort is auto-aligned to `model`: Pro slugs send "extended", everything
+   * else drops the field (the backend then applies the model's natural default).
+   * Set this only to override the level; the slug is passed straight through.
+   */
+  thinkingEffort?: string;
   /** Existing conversation_id to continue; omit on first turn. */
   conversationId?: string;
   /** parent_message_id for multi-turn; falls back to "client-created-root" for the first turn. */

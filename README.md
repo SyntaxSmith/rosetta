@@ -11,7 +11,7 @@ Programmatic access to **ChatGPT (incl. Pro)** from Node, by translating between
 ## What it does
 
 - **Pro support**: `runConversation({ model: "gpt-5-5-pro", ... })` follows the `stream_handoff` event, opens the WebSocket second leg, and aggregates the live CoT until `message_stream_complete` — same UX as the chatgpt.com UI but returnable from Node.
-- **Instant models too**: `gpt-5-3` (or whatever current "instant" slug) returns in seconds via the same path.
+- **Instant models too**: `gpt-5-5` (or whatever current "instant" slug) returns in seconds via the same path.
 - **Multi-turn**: pass `conversationId` + `parentMessageId` (or use `recall: "thread"` for persistence).
 - **Concurrency**: each call spawns its own tab; many calls can stream in parallel.
 - **Live token deltas**: optional `onChunk(delta)` callback streams the CoT as it arrives.
@@ -120,11 +120,11 @@ await runConversation(
 // Multi-turn via persistent recall thread
 await runConversation(
   session,
-  { prompt: "Remember the token BANANA-77.", model: "gpt-5-3", recall: "demo" },
+  { prompt: "Remember the token BANANA-77.", model: "gpt-5-5", recall: "demo" },
 );
 const r2 = await runConversation(
   session,
-  { prompt: "What was the token I asked you to remember?", model: "gpt-5-3", recall: "demo" },
+  { prompt: "What was the token I asked you to remember?", model: "gpt-5-5", recall: "demo" },
 );
 // r2.text === "BANANA-77"
 
@@ -133,7 +133,7 @@ const r2 = await runConversation(
 // and the page's React pipeline handles the rest. 20 MB per-file cap.
 const r3 = await runConversation(session, {
   prompt: "What color is this image?",
-  model: "gpt-5-3",
+  model: "gpt-5-5",
   attachments: [{ path: "./fixtures/red-square.png" }],
 });
 
@@ -158,7 +158,7 @@ const results = await Promise.all(
   ["red", "green", "blue"].map((color) =>
     runConversation(session, {
       prompt: `Reply with the single word: ${color}`,
-      model: "gpt-5-3",
+      model: "gpt-5-5",
     }),
   ),
 );
@@ -320,7 +320,8 @@ Run `pnpm build` in the rosetta repo first so `dist/` exists.
 
 ## Caveats
 
-- ChatGPT's wire shapes shift periodically. The implementation tracks the protocol as of **2026-05** (model picker hidden Pro under `gpt-5-5-pro`; bootstrap SSE emits `stream_handoff`; second-leg WS uses `encoded_item` chunks; send pipeline interleaves `/conversation/init`, `/f/conversation/prepare`, `/sentinel/chat-requirements`, autocompletions, and analytics before the actual `/f/conversation` POST — observed click-to-send latency commonly 15–25 s on multi-turn Pro, so we wait for `prepare` as the "click landed" signal rather than redoing). Wire-shape regressions are caught by a captured-frame replay test.
+- ChatGPT's wire shapes shift periodically. The implementation tracks the protocol as of **2026-06** (model lineup is GPT-5.5: instant default `gpt-5-5`, plus `gpt-5-5-thinking` and `gpt-5-5-pro` — the latter two hidden from `/backend-api/models`; bootstrap SSE emits `stream_handoff`; second-leg WS uses `encoded_item` chunks; send pipeline interleaves `/conversation/init`, `/f/conversation/prepare`, `/sentinel/chat-requirements`, autocompletions, and analytics before the actual `/f/conversation` POST — observed click-to-send latency commonly 15–25 s on multi-turn Pro, so we wait for `prepare` as the "click landed" signal rather than redoing). Wire-shape regressions are caught by a captured-frame replay test.
+- **Reasoning level (`thinking_effort`)**: the 2026-06 composer splits the picker into a model family *and* an intelligence level (极速 / 均衡 / 高级 / 超高, with the Pro lane offering a 标准 / 扩展 sub-level), the latter sent as a `thinking_effort` body field. rosetta auto-aligns it to the pinned model (Pro → `extended`, others drop the field) so an instant call doesn't inherit the account's Pro-default extended thinking; pass `thinkingEffort` (e.g. `"standard"` for Pro 标准) to override.
 - **Attachments**: per-file 20 MB cap (DataTransfer payload, base64-encoded over CDP). Sequential — multiple files attach one at a time, fail-fast if any errors. Pro and instant models accept different file types (vision-only vs file-search-only); if you attach a type the current model doesn't support, the call fails with `upload-timeout` because the page never renders the chip.
 - Per-call tabs and the typing mutex assume one Chrome browser; for high concurrency consider multiple Chrome instances on different ports.
 - Soft-delete on cleanup keeps the conversation list clean; persisted recall threads opt out of soft-delete automatically.

@@ -4,7 +4,7 @@
  * Chrome.
  *
  * Subcommands:
- *   run "<prompt>"              one-shot, default model gpt-5-3
+ *   run "<prompt>"              one-shot, default model gpt-5-5
  *   run --pro "<prompt>"        use gpt-5-5-pro (Pro thinking)
  *   run --model <slug> ...      explicit model slug
  *   run --recall [<thread>] ... thread into a persistent named context
@@ -116,7 +116,7 @@ async function cmdRun(args: string[]): Promise<void> {
   const host = values.host ?? "127.0.0.1";
   const model = values.pro
     ? "gpt-5-5-pro"
-    : (values.model ?? "gpt-5-3");
+    : (values.model ?? "gpt-5-5");
   const recall = values.recall;
   const stream = values.stream;
   const attachments = (values.attach ?? []).map((path) => ({ path }));
@@ -197,7 +197,8 @@ async function cmdProbe(args: string[]): Promise<void> {
       );
     }
     console.log(
-      "\n(Pro slugs like gpt-5-5-pro are hidden from this list; pass --pro on `run`.)",
+      "\n(Per-tier slugs like gpt-5-5-pro / gpt-5-5-thinking are hidden from this list;" +
+        " pass --pro on `run`, or `-m <slug>` for a specific tier.)",
     );
   } finally {
     await session.close();

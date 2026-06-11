@@ -85,7 +85,8 @@ server.registerTool(
         .string()
         .optional()
         .describe(
-          "Explicit model slug (overrides `pro`). E.g. `gpt-5-3` (instant), `gpt-5-5-pro` (Pro).",
+          "Explicit model slug (overrides `pro`). E.g. `gpt-5-5` (instant), " +
+            "`gpt-5-5-thinking` (thinking), `gpt-5-5-pro` (Pro).",
         ),
       fresh: z
         .boolean()
@@ -124,7 +125,7 @@ server.registerTool(
   async (args) => {
     const cdp = await openSession({ port, host });
     try {
-      const model = args.model ?? (args.pro ? "gpt-5-5-pro" : "gpt-5-3");
+      const model = args.model ?? (args.pro ? "gpt-5-5-pro" : "gpt-5-5");
       const usingNamedThread = typeof args.recall === "string" && args.recall.length > 0;
 
       // If `fresh` is set, wipe whichever thread we'd otherwise carry forward.
