@@ -314,16 +314,14 @@ async function runConversationInTab(
     // pinning), so warn loudly — but returning the answer beats a false
     // timeout that kills the turn.
     networkRequestId = e.requestId;
-    if (!claimed) {
-      dbg("networkRequestId bound WITHOUT Fetch claim — recovery path", { id: e.requestId });
-      process.stderr.write(
-        "[rosetta] WARNING: the page issued /backend-api/f/conversation but our " +
-          "Fetch interception never paused it; recovering the response without a " +
-          "body rewrite (model / conversation pinning skipped for this turn).\n",
-      );
-    } else {
-      dbg("networkRequestId bound", { id: e.requestId });
-    }
+    // NOTE (2026-07): `claimed === false` here is NOT yet proof the pause was
+    // missed — Chrome may deliver Network.requestWillBeSent *before* the
+    // Fetch.requestPaused for the same request, and the rewrite still lands.
+    // The genuinely-missed verdict is only known once the response starts
+    // streaming with `claimed` still false; the warning lives there.
+    dbg(claimed ? "networkRequestId bound" : "networkRequestId bound before Fetch claim", {
+      id: e.requestId,
+    });
   };
 
   const onPaused = async (event: {
@@ -420,6 +418,16 @@ async function runConversationInTab(
     observedStatus = e.response.status;
     observedContentType = e.response.mimeType || "";
     dbg("Network.responseReceived", { status: observedStatus, ct: observedContentType });
+    if (!claimed) {
+      // The response is streaming and our Fetch pause never fired — the send
+      // left with the page-built body, so the rewrite (model / conversation
+      // pinning) was genuinely skipped. Recovery path: still read the answer.
+      process.stderr.write(
+        "[rosetta] WARNING: the page issued /backend-api/f/conversation but our " +
+          "Fetch interception never paused it; recovering the response without a " +
+          "body rewrite (model / conversation pinning skipped for this turn).\n",
+      );
+    }
   };
   const onLoadingFinished = async (e: { requestId: string }) => {
     if (e.requestId !== networkRequestId) return;
@@ -831,19 +839,25 @@ function rewriteBody(body: Record<string, unknown>, input: RunConversationInput)
   }
 }
 
-// The 2026-06 GPT-5.5 composer carries a `thinking_effort` field in the
-// `/f/conversation` body, *separate* from the `model` slug — it encodes the
-// "智能水平" level (极速 / 均衡 / 高级 / 超高) and, for the **Pro** lane, a 标准 / 扩展
-// sub-menu. Captured: Pro 扩展 → `"extended"` (the depth we want as default);
-// Pro 标准 → `"standard"` (the lighter Pro depth — inferred, not yet captured).
-// The page builds the outgoing body from the account's composer default lane
-// (commonly Pro → `"extended"`), so pinning a different-lane model would leak that
-// effort and mismatch — e.g. a plain instant request inheriting Pro's extended
-// thinking (an instant `pong` measured 28s → 13s once stripped). Realign to the
-// pinned model's lane: Pro keeps `"extended"` (we default Pro to 扩展); everything
-// else drops the field so the backend applies that model's natural default
-// (matching the pre-5.5 wire shape, which had no `thinking_effort` at all). Override
-// via `input.thinkingEffort` — e.g. `"standard"` for Pro 标准.
+// The composer carries a `thinking_effort` field in the `/f/conversation`
+// body, *separate* from the `model` slug — it encodes the "智能" level. The
+// 2026-07 GPT-5.6 ("Sol") selector is two-axis: a model-family sub-menu
+// (GPT-5.6 Sol / GPT-5.5 / GPT-5.4 / GPT-5.3 / o3) × an effort lane. Captured
+// per lane (via Fetch-abort captures, family = GPT-5.6 Sol unless noted):
+//   极速  → model gpt-5-5           thinking_effort absent  (no 5.6 fast lane!)
+//   中    → model gpt-5-6-thinking  thinking_effort "standard"
+//   高    → model gpt-5-6-thinking  thinking_effort "extended"
+//   极高  → model gpt-5-6-thinking  thinking_effort "max"
+//   Pro   → model gpt-5-6-pro       thinking_effort "standard"
+//   Pro (family GPT-5.5) → gpt-5-5-pro + "extended" (the old 标准/扩展 depth
+//   survives per-family; 5.6 Pro has no 扩展 entry and sends "standard").
+// The page builds the outgoing body from the account's composer default lane,
+// so pinning a different-lane model would leak that lane's effort and mismatch
+// — e.g. a plain instant request inheriting extended thinking (an instant
+// `pong` measured 28s → 13s once stripped). Realign to the pinned model's
+// lane: -pro slugs get their family's UI value; everything else drops the
+// field so the backend applies that model's natural default. Override via
+// `input.thinkingEffort` — e.g. `"max"` on gpt-5-6-thinking for the 极高 lane.
 function alignThinkingEffort(body: Record<string, unknown>, input: RunConversationInput): void {
   if (input.thinkingEffort !== undefined) {
     body.thinking_effort = input.thinkingEffort;
@@ -852,8 +866,7 @@ function alignThinkingEffort(body: Record<string, unknown>, input: RunConversati
   if (!("thinking_effort" in body)) return;
   const model = input.model ?? "";
   if (/-pro$/.test(model)) {
-    // Default the Pro lane to 扩展/extended (the deeper of Pro's 标准/扩展 sub-levels).
-    body.thinking_effort = "extended";
+    body.thinking_effort = model === "gpt-5-5-pro" ? "extended" : "standard";
   } else {
     delete body.thinking_effort;
   }

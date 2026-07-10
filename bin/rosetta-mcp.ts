@@ -79,14 +79,23 @@ server.registerTool(
         .boolean()
         .optional()
         .describe(
-          "Use ChatGPT Pro (gpt-5-5-pro) with extended thinking. Slower but more capable.",
+          "Force ChatGPT Pro (gpt-5-6-pro). Redundant — Pro is already the default; " +
+            "kept for backward compatibility.",
         ),
       model: z
         .string()
         .optional()
         .describe(
-          "Explicit model slug (overrides `pro`). E.g. `gpt-5-5` (instant), " +
-            "`gpt-5-5-thinking` (thinking), `gpt-5-5-pro` (Pro).",
+          "Explicit model slug (overrides `pro`). Default `gpt-5-6-pro`. Cheaper tiers: " +
+            "`gpt-5-6-thinking` (thinking), `gpt-5-6` (base), `gpt-5-5` (the UI's fast lane).",
+        ),
+      thinkingEffort: z
+        .string()
+        .optional()
+        .describe(
+          "thinking_effort override: `standard` | `extended` | `max`. The web UI's " +
+            "中/高/极高 lanes are `gpt-5-6-thinking` with these three values. Omit to use " +
+            "the model's natural default.",
         ),
       fresh: z
         .boolean()
@@ -125,7 +134,7 @@ server.registerTool(
   async (args) => {
     const cdp = await openSession({ port, host });
     try {
-      const model = args.model ?? (args.pro ? "gpt-5-5-pro" : "gpt-5-5");
+      const model = args.model ?? "gpt-5-6-pro";
       const usingNamedThread = typeof args.recall === "string" && args.recall.length > 0;
 
       // If `fresh` is set, wipe whichever thread we'd otherwise carry forward.
@@ -148,6 +157,7 @@ server.registerTool(
         prompt: args.prompt,
         model,
       };
+      if (args.thinkingEffort) runInput.thinkingEffort = args.thinkingEffort;
       let isSessionThread = false;
       if (usingNamedThread) {
         runInput.recall = args.recall as string;
