@@ -3,20 +3,21 @@
  * element in the composer. The page may expose multiple file-input nodes (avatar
  * uploader, message attach, etc.); the most specific selectors come first so we
  * attach to the composer's primary dropzone rather than a stray input elsewhere
- * on the page.
+ * on the page. `findFileInputSelector` evaluates all matches and scores them;
+ * this order is now only a tie-breaking preference, not the sole safeguard.
  *
  * Ported from oracle (predecessor project) — battle-tested across 2024-2026
  * ChatGPT DOM revisions.
  */
 export const FILE_INPUT_SELECTORS = [
   'form input[type="file"]:not([accept])',
+  'input[type="file"][data-testid*="file"]',
   'input[type="file"][multiple]:not([accept])',
   'input[type="file"][multiple]',
   'input[type="file"]:not([accept])',
   'form input[type="file"][accept]',
   'input[type="file"][accept]',
   'input[type="file"]',
-  'input[type="file"][data-testid*="file"]',
 ] as const;
 
 /**

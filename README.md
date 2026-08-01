@@ -220,12 +220,22 @@ consult({
 | You want… | What to pass |
 |---|---|
 | Continue this session's conversation (default) | nothing — just `{prompt}` |
-| Start a new conversation (like clicking *New chat*) | `fresh: true` |
+| Continue with follow-ups, revisions, related subtasks, or new evidence | nothing — just `{prompt}` |
+| Start a genuinely unrelated, independent adversarial/zero-context, or replacement conversation | `fresh: true` |
 | Long-lived context that survives MCP restarts | `recall: "research-on-X"` |
 | Reset a long-lived context | `fresh: true, recall: "research-on-X"` |
 | Continue an arbitrary existing conversation | `conversationId: "<id>"` |
 
-This way, Claude Code session A and Claude Code session B each spawn their own `rosetta-mcp` process and their conversations stay isolated automatically — no thread-naming required from the AI.
+Default to continuation. Do not pass `fresh` merely because the next prompt is
+self-contained or moves to a related subtask. Reserve it for a genuinely
+unrelated problem, an intentionally independent adversarial/zero-context
+assessment, an overlong or contaminated thread, or an explicit user request.
+
+Each host agent/MCP process has its own implicit conversation. That isolates
+Claude Code session A from session B, but it also means Codex subagents or agent
+threads may not share the root agent's implicit context. Use one stable
+descriptive `recall` name when context must cross those boundaries or survive a
+host restart.
 
 ### Claude Code skill
 

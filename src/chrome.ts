@@ -90,6 +90,10 @@ export interface ChromeClient {
       headers?: Array<{ name: string; value: string }>;
       interceptResponse?: boolean;
     }): Promise<void>;
+    failRequest(params: {
+      requestId: string;
+      errorReason: "Aborted";
+    }): Promise<void>;
     requestPaused(
       handler: (event: {
         requestId: string;

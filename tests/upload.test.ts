@@ -1,12 +1,15 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   MAX_DATA_TRANSFER_BYTES,
   RosettaUploadError,
+  attachFiles,
+  findFileInputSelector,
   guessMimeType,
   transferAttachmentViaDataTransfer,
+  waitForAttachmentReady,
 } from "../src/upload.js";
 
 let tempDir: string;
@@ -15,6 +18,7 @@ beforeEach(() => {
   tempDir = mkdtempSync(path.join(tmpdir(), "rosetta-upload-test-"));
 });
 afterEach(() => {
+  vi.useRealTimers();
   // Best-effort cleanup; small files in tmpdir, OS will reap regardless.
 });
 
@@ -158,6 +162,128 @@ describe("transferAttachmentViaDataTransfer", () => {
       name: "RosettaUploadError",
       code: "upload-failed",
       attachmentPath: fixturePath,
+    });
+  });
+});
+
+describe("production DOM.setFileInputFiles path", () => {
+  test("findFileInputSelector marks and returns one exact scored input", async () => {
+    const exactSelector = '[data-rosetta-file-input="rosetta-test"]';
+    const { runtime, captures } = makeStubRuntime(() => exactSelector);
+
+    await expect(
+      findFileInputSelector(
+        runtime as unknown as Parameters<typeof findFileInputSelector>[0],
+      ),
+    ).resolves.toBe(exactSelector);
+
+    expect(captures).toHaveLength(1);
+    expect(captures[0]!.expression).toContain("candidates.sort");
+    expect(captures[0]!.expression).toContain("data-rosetta-file-input");
+    expect(captures[0]!.expression).toContain("composerLike");
+  });
+
+  test("sets the file only after the React upload handler is ready", async () => {
+    const fixturePath = path.join(tempDir, "ready.txt");
+    writeFileSync(fixturePath, "ready");
+    const exactSelector = '[data-rosetta-file-input="rosetta-ready"]';
+
+    const runtime = {
+      async evaluate(params: CapturedEval) {
+        if (params.expression.includes("const selectors =")) {
+          return { result: { value: exactSelector } };
+        }
+        if (params.expression.includes("k.startsWith('__reactProps$')")) {
+          return { result: { value: true } };
+        }
+        if (params.returnByValue === false) {
+          return { result: { objectId: "file-input-1" } };
+        }
+        if (params.expression.includes("let chipNamed = false")) {
+          return { result: { value: { chipNamed: true, uploading: false } } };
+        }
+        throw new Error(`Unexpected Runtime.evaluate: ${params.expression.slice(0, 80)}`);
+      },
+    };
+    const setFileInputFiles = vi.fn(async () => undefined);
+
+    const promise = attachFiles(
+      {
+        Runtime: runtime,
+        DOM: { setFileInputFiles },
+      } as unknown as Parameters<typeof attachFiles>[0],
+      [{ path: fixturePath }],
+    );
+    await promise;
+
+    expect(setFileInputFiles).toHaveBeenCalledTimes(1);
+    expect(setFileInputFiles).toHaveBeenCalledWith({
+      files: [fixturePath],
+      objectId: "file-input-1",
+    });
+  });
+
+  test("does not inject a file when the React handler never becomes ready", async () => {
+    vi.useFakeTimers();
+    const fixturePath = path.join(tempDir, "not-ready.txt");
+    writeFileSync(fixturePath, "not ready");
+    const exactSelector = '[data-rosetta-file-input="rosetta-not-ready"]';
+
+    const runtime = {
+      async evaluate(params: CapturedEval) {
+        if (params.expression.includes("const selectors =")) {
+          return { result: { value: exactSelector } };
+        }
+        return { result: { value: false } };
+      },
+    };
+    const setFileInputFiles = vi.fn(async () => undefined);
+    const promise = attachFiles(
+      {
+        Runtime: runtime,
+        DOM: { setFileInputFiles },
+      } as unknown as Parameters<typeof attachFiles>[0],
+      [{ path: fixturePath }],
+    );
+    const rejection = expect(promise).rejects.toMatchObject({
+      name: "RosettaUploadError",
+      code: "upload-timeout",
+      attachmentPath: fixturePath,
+      retryable: true,
+    });
+
+    await vi.advanceTimersByTimeAsync(16_000);
+    await rejection;
+    expect(setFileInputFiles).not.toHaveBeenCalled();
+  });
+
+  test("surfaces a visible ChatGPT upload rejection without waiting for timeout", async () => {
+    const runtime = {
+      async evaluate() {
+        return {
+          result: {
+            value: {
+              chipNamed: false,
+              uploading: false,
+              errorText: "Unsupported file type",
+            },
+          },
+        };
+      },
+    };
+
+    await expect(
+      waitForAttachmentReady(
+        runtime as unknown as Parameters<typeof waitForAttachmentReady>[0],
+        { path: "/tmp/archive.bin" },
+        "archive.bin",
+        1_000,
+        '[data-rosetta-file-input="x"]',
+      ),
+    ).rejects.toMatchObject({
+      code: "upload-failed",
+      retryable: false,
+      message: expect.stringContaining("Unsupported file type"),
     });
   });
 });

@@ -46,7 +46,7 @@ import {
 } from "../src/index.js";
 
 const SERVER_NAME = "rosetta";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.3.2";
 
 const port = Number(process.env["ROSETTA_CDP_PORT"] ?? 9222);
 const host = process.env["ROSETTA_CDP_HOST"] ?? "127.0.0.1";
@@ -70,9 +70,11 @@ server.registerTool(
       "return the assistant's text. Pro thinking can take 30s–15min depending " +
       "on the prompt; the call blocks until the answer streams back.\n\n" +
       "By default, successive calls in the same MCP session continue the same " +
-      "conversation (multi-turn context retained). Pass `fresh: true` to start " +
-      "a new conversation, or `recall: \"<name>\"` to use a disk-persisted " +
-      "thread that survives process restarts.",
+      "conversation (multi-turn context retained). Keep that default for follow-ups, " +
+      "revisions, related subtasks, and new evidence. Pass `fresh: true` only for a " +
+      "genuinely unrelated problem, an independent zero-context/adversarial review, " +
+      "an overlong or contaminated thread, or an explicit user request. Use " +
+      "`recall: \"<name>\"` for a disk-persisted thread that survives process restarts.",
     inputSchema: {
       prompt: z.string().min(1).describe("The user prompt to send to ChatGPT."),
       pro: z
@@ -103,7 +105,10 @@ server.registerTool(
         .describe(
           "Abandon the current session conversation and start a new one. The new " +
             "conversation becomes the session default for subsequent calls. Combine " +
-            "with `recall` to reset that named thread instead.",
+            "with `recall` to reset that named thread instead. Do not use for ordinary " +
+            "follow-ups or related subtasks; reserve it for unrelated problems, " +
+            "independent zero-context/adversarial reviews, overlong/contaminated " +
+            "threads, or an explicit user request.",
         ),
       recall: z
         .string()
@@ -203,6 +208,7 @@ server.registerTool(
           finishReason: result.finishReason ?? "",
           tookMs: result.tookMs,
           eventCount: result.eventCount,
+          serverPid: process.pid,
           threadKind: usingNamedThread ? ("named" as const) : ("session" as const),
           threadName: usingNamedThread ? args.recall : undefined,
         },

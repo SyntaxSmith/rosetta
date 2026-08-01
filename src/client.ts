@@ -6,6 +6,11 @@ import {
   parseConversationSse,
   stripCitations,
 } from "./sse.js";
+import {
+  evaluateProTurnCompletion,
+  type ConversationMapping,
+  type ConversationMappingMessage,
+} from "./pro-final.js";
 import { loadThread, resolveThreadName, saveThread } from "./state.js";
 import type {
   RunConversationInput,
@@ -172,10 +177,45 @@ export async function runConversation(
   // Each call runs in its own freshly-created tab so concurrent calls don't
   // race on Fetch.requestPaused (Fetch.enable patterns are per-CDP-target).
   // Multi-turn turns share state via the conversationId, not via tab reuse.
-  const result = await withFreshTab(session, async (tabClient) => {
-    return await runConversationInTab(session, tabClient, effectiveInput, effectiveOptions);
-  });
+  const runInFreshTab = async (): Promise<RunConversationResult> =>
+    await withFreshTab(session, async (tabClient) => {
+      return await runConversationInTab(session, tabClient, effectiveInput, effectiveOptions);
+    });
 
+  return await runWithNamedThreadPersistence(threadName, async () => {
+    let result: RunConversationResult;
+    try {
+      result = await runInFreshTab();
+    } catch (err) {
+      const canRetryAttachment =
+        err instanceof RosettaUploadError &&
+        err.retryable &&
+        Boolean(effectiveInput.attachments?.length);
+      if (!canRetryAttachment) throw err;
+
+      // Upload-handler hydration and composer DOM races are scoped to the current
+      // page load. Reusing that page cannot recover (the file may have been routed
+      // to the persistent library), but a new tab is safe because no conversation
+      // request has been allowed to leave. Retry exactly once to avoid masking a
+      // persistent DOM/protocol drift or an unsupported file type.
+      process.stderr.write(
+        `[rosetta] attachment setup failed in the first tab; retrying once in a fresh tab: ${err.message}\n`,
+      );
+      result = await runInFreshTab();
+    }
+    return result;
+  });
+}
+
+/** @internal Exported so persistence-on-failure behavior can be regression-tested. */
+export async function runWithNamedThreadPersistence(
+  threadName: string | undefined,
+  operation: () => Promise<RunConversationResult>,
+): Promise<RunConversationResult> {
+  // The operation must include Pro final-state verification. Await it before
+  // touching state so an abort, timeout, socket loss, or unverifiable mapping
+  // leaves the previous named-thread pointer intact.
+  const result = await operation();
   if (threadName && result.conversationId && result.messageId) {
     saveThread(threadName, {
       conversationId: result.conversationId,
@@ -184,7 +224,6 @@ export async function runConversation(
       updatedAt: Date.now(),
     });
   }
-
   return result;
 }
 
@@ -371,6 +410,14 @@ async function runConversationInTab(
       // Network layer recover the response (the same recovery path used when a
       // Fetch pause is missed entirely). We lose the body rewrite, so warn.
       if (!event.request.postData) {
+        if (input.attachments && input.attachments.length > 0) {
+          throw new RosettaUploadError(
+            "Attachments were provided but CDP omitted the /f/conversation request body, so Rosetta cannot verify that the page included the file reference. The request was aborted instead of sending an unverified file-less turn.",
+            "upload-failed",
+            input.attachments[0]!.path,
+            true,
+          );
+        }
         dbg("/f/conversation paused without inline postData — passing through unrewritten", {
           hasPostData: event.request.hasPostData,
         });
@@ -392,6 +439,7 @@ async function runConversationInTab(
           "Attachments were provided but the page-issued /f/conversation request carried no file reference — the upload did not attach to the message. The composer DOM or upload pipeline may have changed.",
           "upload-failed",
           input.attachments[0]!.path,
+          true,
         );
       }
       rewriteBody(body, input);
@@ -406,6 +454,15 @@ async function runConversationInTab(
         headers: safeHeaders,
       });
     } catch (err) {
+      // A Fetch-stage exception leaves the browser request paused indefinitely
+      // unless we explicitly resolve it. Abort rather than continue: continuing
+      // after a failed rewrite could send the placeholder prompt or silently
+      // drop an attachment. Retriable upload failures are rerun in a fresh tab
+      // by `runConversation`; all other failures surface their original cause.
+      await Fetch.failRequest({
+        requestId: event.requestId,
+        errorReason: "Aborted",
+      }).catch(() => undefined);
       rejectResult(err);
     }
   };
@@ -1123,7 +1180,7 @@ function stringStream(text: string): AsyncIterable<Uint8Array> {
   };
 }
 
-interface StreamHandoff {
+export interface StreamHandoff {
   conversationId: string;
   turnExchangeId: string;
   topicId: string;
@@ -1167,13 +1224,12 @@ function extractStreamHandoff(sseText: string): StreamHandoff | null {
  * the live CoT + final answer back into the aggregator. Returns the same
  * `RunConversationResult` shape as the instant path.
  *
- * Termination signals (any of these resolves):
- *   - assistant `/message/status` reaches `finished_successfully`
- *   - frame containing `data: [DONE]` in its encoded_item
- *   - `Network.webSocketClosed`
- *   - caller AbortSignal aborts
+ * WebSocket terminators only end the live-stream phase. Before this function
+ * resolves, the current turn is always verified through the conversation REST
+ * mapping. A stream marker, `[DONE]`, idle gap, or socket close is not proof
+ * that Pro has stopped reasoning.
  */
-async function streamSecondLeg(
+export async function streamSecondLeg(
   client: ChromeClient,
   session: RosettaSession,
   bootstrapText: string,
@@ -1305,6 +1361,8 @@ async function streamSecondLeg(
     }
   };
   const onClosed = (e: { requestId: string }) => {
+    // A normal close can happen between Pro phases. Stop draining this socket,
+    // then let the mandatory REST verifier decide whether the turn is final.
     if (e.requestId === ourWsRequestId) queue.end();
   };
 
@@ -1427,11 +1485,28 @@ async function streamSecondLeg(
     }
     dbg("WS setup ok (subscribed)");
 
-    // 5. Aggregate the merged stream until termination, firing onChunk
-    //    deltas live as the assistant message grows.
+    // 5. Aggregate the merged stream until a *stream-phase boundary*, firing
+    //    onChunk deltas live as assistant text grows. The aggregate is progress
+    //    only and is deliberately discarded: message_stream_complete,
+    //    last_token, [DONE], idle, and socket close cannot prove Pro turn
+    //    completion.
     const events = parseConversationSse(queue);
-    const result = await aggregateUntilFinished(events, startedAt, queue, onChunk);
-    return result;
+    await aggregateUntilFinished(events, startedAt, queue, onChunk);
+    if (signal?.aborted) {
+      throw new RosettaRequestError(
+        "Aborted before Pro final-state verification",
+        0,
+        undefined,
+        "trigger-failed",
+      );
+    }
+    dbg("WS stream phase ended — verifying current Pro turn via REST mapping");
+    // Do not replay REST text through onChunk after the WebSocket already
+    // emitted progress. The returned result still contains the complete,
+    // authoritative final answer.
+    return await pollConversationForFinal(
+      session, handoff, startedAt, signal, idleTimeoutMs, onChunk, false,
+    );
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
     for (const u of unsubs) {
@@ -1459,47 +1534,26 @@ async function streamSecondLeg(
  * `poll_on_websocket_inactivity_ms` in message metadata as the prescribed
  * recovery).
  *
- * Termination signals (any of these resolves):
- *   - an assistant descendant of our turn has content_type=text,
- *     status=finished_successfully, end_turn=true
- *   - caller AbortSignal aborts
- *   - idleTimeoutMs elapses without forward progress (growing parts)
+ * Resolution requires `evaluateProTurnCompletion` to prove the exact current
+ * turn has a trusted reasoning_ended recap followed by its terminal text.
+ * Aborts, timeouts, and unverifiable mappings reject instead of returning the
+ * latest stage summary.
  */
-type PollMessageNode = {
-  id: string;
-  message: {
-    id: string;
-    author?: { role?: string };
-    recipient?: string;
-    create_time?: number;
-    content?: { content_type?: string; parts?: unknown[] };
-    status?: string;
-    end_turn?: boolean | null;
-    metadata?: {
-      model_slug?: string;
-      turn_exchange_id?: string;
-      poll_interval_ms?: number;
-      reasoning_status?: string;
-      finish_details?: { type?: string };
-    } & Record<string, unknown>;
-  } | null;
-};
-
-async function pollConversationForFinal(
+export async function pollConversationForFinal(
   session: RosettaSession,
   handoff: StreamHandoff,
   startedAt: number,
   signal: AbortSignal | undefined,
   idleTimeoutMs: number,
   onChunk: ((delta: string) => void) | undefined,
+  emitFinalChunk = true,
 ): Promise<RunConversationResult> {
   // Default cadence; tightened toward server-advertised poll_interval_ms once
   // we observe it on the assistant message metadata.
   let intervalMs = 5_000;
   let eventCount = 0;
-  let emittedLen = 0;
-  let emittedNodeId: string | undefined;
-  let maxCtimeSeen = 0;
+  let lastTurnSignature = "";
+  let lastVerificationReason = "conversation mapping not fetched yet";
   let lastProgressAt = Date.now();
 
   // Polling has no WS-heartbeat liveness — the only "progress" signal is a new
@@ -1538,157 +1592,119 @@ async function pollConversationForFinal(
       });
     } catch (err) {
       dbg("poll fetch error", { err: String(err) });
+      lastVerificationReason = `conversation GET failed: ${String(err)}`;
+      if (effectiveIdleMs > 0 && Date.now() - lastProgressAt > effectiveIdleMs) {
+        throw pollingIncompleteError(
+          handoff.conversationId,
+          effectiveIdleMs,
+          lastVerificationReason,
+        );
+      }
       await sleep(intervalMs, signal);
       continue;
     }
     eventCount += 1;
     if (resp.status === 200) {
-      const body = resp.body as { mapping?: Record<string, PollMessageNode> };
+      const body = resp.body as { mapping?: ConversationMapping };
       const mapping = body.mapping ?? {};
 
-      // Collect every assistant message that belongs to our turn. We deliberately
-      // walk the whole turn — not just `content_type=text` — because the
-      // *legitimate* completion signal lives on a non-text node: the
-      // `reasoning_recap` carries `metadata.reasoning_status === "reasoning_ended"`
-      // once Pro stops thinking. Earlier code returned on the first
-      // `text + end_turn=true` it found, which on Pro turns is a SHORT preamble
-      // node ("I'll first clarify…") emitted ~20–40 s in — minutes before the
-      // actual answer.
-      const turnNodes: Array<NonNullable<PollMessageNode["message"]>> = [];
-      let reasoningEnded = false;
-      for (const node of Object.values(mapping)) {
+      // Exact turn matching is mandatory. A missing turn_exchange_id is not a
+      // wildcard, and adjacent turns in the same conversation cannot supply
+      // either progress or completion evidence for this one.
+      const turnNodes: Array<{ key: string; message: ConversationMappingMessage }> = [];
+      for (const [key, node] of Object.entries(mapping)) {
         const m = node.message;
-        if (!m || m.author?.role !== "assistant") continue;
-        const tx = m.metadata?.turn_exchange_id;
-        if (handoff.turnExchangeId && tx && tx !== handoff.turnExchangeId) continue;
-        turnNodes.push(m);
+        if (!m || m.metadata?.turn_exchange_id !== handoff.turnExchangeId) continue;
+        turnNodes.push({ key, message: m });
         const pim = m.metadata?.poll_interval_ms;
         if (typeof pim === "number" && pim >= 1000 && pim < intervalMs) {
           intervalMs = pim;
         }
-        if (m.metadata?.reasoning_status === "reasoning_ended") {
-          reasoningEnded = true;
-        }
       }
 
-      // Track the latest `content_type=text, recipient=all, end_turn=true,
-      // status=finished_successfully` node by create_time. On a Pro turn the
-      // first such node is the preamble; the second (≈minutes later) is the
-      // real answer. They share turn_exchange_id, so we pick by ctime.
-      let finalCandidate: NonNullable<PollMessageNode["message"]> | undefined;
-      for (const m of turnNodes) {
-        if (m.content?.content_type !== "text") continue;
-        if (m.recipient !== undefined && m.recipient !== "all") continue;
-        if (m.status !== "finished_successfully") continue;
-        if (m.end_turn !== true) continue;
-        if (
-          !finalCandidate ||
-          (m.create_time ?? 0) > (finalCandidate.create_time ?? 0)
-        ) {
-          finalCandidate = m;
-        }
-      }
-
-      // Stream progress: follow the current latest-text candidate. If the
-      // candidate id flips (preamble → real answer), reset the cursor so the
-      // caller sees the new text from its beginning rather than as a malformed
-      // delta computed against the preamble length.
-      if (finalCandidate) {
-        if (finalCandidate.id !== emittedNodeId) {
-          emittedNodeId = finalCandidate.id;
-          emittedLen = 0;
-        }
-        const parts = finalCandidate.content?.parts;
-        const text =
-          Array.isArray(parts) && typeof parts[0] === "string"
-            ? (parts[0] as string)
-            : "";
-        if (text.length > emittedLen) {
-          if (onChunk) onChunk(text.slice(emittedLen));
-          emittedLen = text.length;
-          lastProgressAt = Date.now();
-        }
-      }
-
-      // Liveness: any new turn node (thoughts, code, recap, …) counts as
-      // progress. Without this, a Pro turn that emits a 208-char preamble then
-      // 8 minutes of empty thoughts nodes would trip idleTimeoutMs (90 s by
-      // default) since `emittedLen` stops growing.
-      let maxCtimeThisPoll = 0;
-      for (const m of turnNodes) {
-        if (typeof m.create_time === "number" && m.create_time > maxCtimeThisPoll) {
-          maxCtimeThisPoll = m.create_time;
-        }
-      }
-      if (maxCtimeThisPoll > maxCtimeSeen) {
-        maxCtimeSeen = maxCtimeThisPoll;
+      // Liveness uses node identity + content/status shape, not create_time.
+      // Server timestamps can be equal or arrive out of order (the observed
+      // reasoning_recap and final text share one timestamp).
+      const turnSignature = turnNodes
+        .map(({ key, message }) => {
+          const part = message.content?.parts?.[0];
+          const partLength = typeof part === "string" ? part.length : 0;
+          return [
+            key,
+            message.content?.content_type ?? "",
+            message.status ?? "",
+            message.metadata?.reasoning_status ?? "",
+            message.metadata?.finish_details?.type ?? "",
+            partLength,
+          ].join(":");
+        })
+        .sort()
+        .join("|");
+      if (turnSignature !== lastTurnSignature) {
+        lastTurnSignature = turnSignature;
         lastProgressAt = Date.now();
       }
 
-      // Termination signal: a `reasoning_recap` node has appeared with
-      // `metadata.reasoning_status === "reasoning_ended"` AND we have a final
-      // text candidate that's at least as new as every other node in the
-      // turn. We never enter this function except through `streamSecondLeg`,
-      // which fires only when the bootstrap SSE carried a `stream_handoff`
-      // event — and that handoff is Pro-only. Any cheaper "first text +
-      // end_turn=true → done" rule misfires on Pro: a *preamble* text node
-      // ("I'll first clarify…") lands 20–40 s in and satisfies it minutes
-      // before the actual answer.
-      let done = false;
-      if (finalCandidate && reasoningEnded) {
-        const candCtime = finalCandidate.create_time ?? 0;
-        let latestNonText = 0;
-        for (const m of turnNodes) {
-          if (m === finalCandidate) continue;
-          const t = m.create_time ?? 0;
-          if (t > latestNonText) latestNonText = t;
-        }
-        if (candCtime >= latestNonText) done = true;
-      }
-
-      if (done && finalCandidate) {
-        const parts = finalCandidate.content?.parts;
-        const text =
-          Array.isArray(parts) && typeof parts[0] === "string"
-            ? (parts[0] as string)
-            : "";
+      const verification = evaluateProTurnCompletion(mapping, handoff.turnExchangeId);
+      lastVerificationReason = verification.reason ?? "verified";
+      if (
+        verification.done &&
+        verification.finalText &&
+        verification.finalMessageId
+      ) {
+        const text = stripCitations(verification.finalText);
+        if (emitFinalChunk && onChunk) onChunk(text);
         dbg("poll fallback done", {
-          msgId: finalCandidate.id,
+          msgId: verification.finalMessageId,
           textLen: text.length,
           polls: eventCount,
-          reasoningEnded,
         });
         return {
-          text: stripCitations(text),
+          text,
           conversationId: handoff.conversationId,
-          messageId: finalCandidate.id,
-          modelSlug: finalCandidate.metadata?.model_slug,
-          finishReason:
-            finalCandidate.metadata?.finish_details?.type ?? finalCandidate.status ?? "stop",
+          messageId: verification.finalMessageId,
+          modelSlug: verification.modelSlug,
+          finishReason: verification.finishReason,
           tookMs: Date.now() - startedAt,
           eventCount,
         };
       }
     } else if (resp.status === 404) {
       // Conversation hasn't been persisted yet — keep polling briefly.
+      lastVerificationReason = "conversation mapping is not persisted yet (HTTP 404)";
       dbg("poll 404 — conversation not yet visible", { convId: handoff.conversationId });
     } else {
+      lastVerificationReason = `conversation GET returned HTTP ${resp.status}`;
       dbg("poll non-200", { status: resp.status });
     }
     if (effectiveIdleMs > 0 && Date.now() - lastProgressAt > effectiveIdleMs) {
-      throw new RosettaRequestError(
-        `Polling timed out — no progress on conversation ${handoff.conversationId} for ${Math.round(effectiveIdleMs / 1000)} s`,
-        0,
-        undefined,
-        "server",
+      throw pollingIncompleteError(
+        handoff.conversationId,
+        effectiveIdleMs,
+        lastVerificationReason,
       );
     }
     await sleep(intervalMs, signal);
   }
 }
 
+function pollingIncompleteError(
+  conversationId: string,
+  idleMs: number,
+  reason: string,
+): RosettaRequestError {
+  return new RosettaRequestError(
+    `INCOMPLETE Pro turn: final state could not be verified for conversation ${conversationId} ` +
+      `after ${Math.round(idleMs / 1000)} s without progress (last check: ${reason}). ` +
+      "No stage text was returned or persisted.",
+    0,
+    undefined,
+    "server",
+  );
+}
+
 async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (ms <= 0) return;
+  if (ms <= 0 || signal?.aborted) return;
   await new Promise<void>((resolve) => {
     let abortHandler: (() => void) | undefined;
     const t = setTimeout(() => {
@@ -1703,10 +1719,9 @@ async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Drains an SSE event iterator and detects Pro turn completion: status patch
- * to `finished_successfully`, `last_token` marker, or [DONE]. On detection,
- * end the underlying queue so the iterator terminates and we can return the
- * aggregated result.
+ * Drains an SSE iterator until its current transport phase ends. This helper
+ * never proves Pro turn completion; its aggregate is authoritative only for
+ * the instant path. Pro callers must verify the conversation mapping afterward.
  */
 async function aggregateUntilFinished(
   events: AsyncIterable<unknown>,
@@ -1717,7 +1732,7 @@ async function aggregateUntilFinished(
   // Tee the stream into two consumers:
   //   1. the aggregator (folds events into final state)
   //   2. a sniffer that fires onChunk on text growth and ends the queue
-  //      when the terminator arrives
+  //      when a transport-phase boundary arrives
   // The sniffer needs the same view as the aggregator so it sees real
   // assistant text deltas (not patches against tool/system messages).
   const [forAgg, forSniff] = teeAsync(events);
@@ -1738,7 +1753,7 @@ async function aggregateUntilFinished(
             lastText = delta.newFullText;
           }
         }
-        if (isFinishingEvent(evObj)) {
+        if (isProStreamPhaseBoundaryEvent(evObj)) {
           queue.end();
           return;
         }
@@ -1820,14 +1835,12 @@ function extractAssistantDelta(
   return { text: "", newFullText: prevFullText };
 }
 
-function isFinishingEvent(ev: Record<string, unknown>): boolean {
-  // The only safe terminator. Pro and instant both emit it AFTER the final
-  // assistant message + any tail metadata. Earlier signals like
-  // `assistant end_turn=true` are unreliable: Pro replays the same message
-  // twice — first with empty text, then with the answer — so terminating on
-  // end_turn cuts the turn short and yields an empty result.
+export function isProStreamPhaseBoundaryEvent(ev: Record<string, unknown>): boolean {
+  // These signals only say the current stream segment ended. Live Pro turns
+  // can emit either one, then append more reasoning/text nodes to the same
+  // turn_exchange_id. streamSecondLeg therefore always follows this boundary
+  // with REST mapping verification.
   if (ev.type === "message_stream_complete") return true;
-  // Last-resort fallback for older builds that omit message_stream_complete.
   if (ev.type === "message_marker" && (ev as { marker?: string }).marker === "last_token") {
     return true;
   }

@@ -33,6 +33,12 @@ export class RosettaUploadError extends Error {
     message: string,
     public readonly code: "upload-failed" | "upload-timeout",
     public readonly attachmentPath: string,
+    /**
+     * True when retrying the whole turn in a fresh tab is safe and may recover.
+     * Upload errors are raised before the conversation request is sent, or after
+     * that request has been explicitly aborted by the Fetch interceptor.
+     */
+    public readonly retryable = false,
   ) {
     super(message);
     this.name = "RosettaUploadError";
@@ -168,23 +174,58 @@ export async function transferAttachmentViaDataTransfer(
 }
 
 /**
- * Search the page for a usable file-input element by trying the ranked
- * `FILE_INPUT_SELECTORS` list in order. Returns the first selector that
- * matches a real `<input type="file">` element on the page, or `null` if
- * none of them resolve.
+ * Search the page for the composer's file-input element. ChatGPT currently
+ * exposes several file inputs (composer attachments, photo upload, avatar,
+ * etc.), so selector order alone is not enough. We rank every match using
+ * composer/form proximity, React handler presence, multiplicity, and accept
+ * type, then mark the winning node with a per-call data attribute. Returning
+ * that exact marker selector prevents a later `document.querySelector` from
+ * resolving a different node matched by the same broad fallback selector.
  */
 export async function findFileInputSelector(
   runtime: ChromeClient["Runtime"],
 ): Promise<string | null> {
   const expression = `(() => {
     const selectors = ${JSON.stringify(FILE_INPUT_SELECTORS)};
+    const hasReactHandler = (el) => {
+      for (let n = el, hops = 0; n && hops < 6; n = n.parentElement, hops++) {
+        const key = Object.keys(n).find((k) => k.startsWith('__reactProps$'));
+        if (!key) continue;
+        const p = n[key];
+        if (p && (typeof p.onChange === 'function' || typeof p.onInput === 'function')) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const seen = new Set();
+    const candidates = [];
     for (const sel of selectors) {
-      const el = document.querySelector(sel);
-      if (el && el.tagName === 'INPUT' && el.type === 'file') {
-        return sel;
+      for (const el of document.querySelectorAll(sel)) {
+        if (!(el instanceof HTMLInputElement) || el.type !== 'file' || seen.has(el)) continue;
+        seen.add(el);
+        const accept = (el.getAttribute('accept') || '').toLowerCase();
+        const form = el.closest('form');
+        const composerLike = Boolean(
+          form?.querySelector('textarea, [contenteditable="true"], #prompt-textarea')
+        );
+        let score = 0;
+        if (composerLike) score += 200;
+        else if (form) score += 80;
+        if (hasReactHandler(el)) score += 100;
+        if (el.multiple) score += 30;
+        if (!accept) score += 40;
+        if (accept.includes('image/') && !composerLike) score -= 80;
+        if ((el.getAttribute('data-testid') || '').toLowerCase().includes('file')) score += 20;
+        candidates.push({ el, score });
       }
     }
-    return null;
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => b.score - a.score);
+    const marker = 'rosetta-' + Date.now().toString(36) + '-' +
+      Math.random().toString(36).slice(2);
+    candidates[0].el.setAttribute('data-rosetta-file-input', marker);
+    return '[data-rosetta-file-input="' + marker + '"]';
   })()`;
   const r = await runtime.evaluate({ expression, returnByValue: true });
   const v = r.result?.value;
@@ -211,6 +252,7 @@ export async function waitForAttachmentReady(
   attachment: Attachment,
   fileName: string,
   timeoutMs: number = DEFAULT_ATTACHMENT_READY_TIMEOUT_MS,
+  inputSelector?: string,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   const tickMs = 250;
@@ -229,9 +271,11 @@ export async function waitForAttachmentReady(
   const expression = `(() => {
     const name = ${JSON.stringify(fileName)}.toLowerCase();
     const stem = ${JSON.stringify(stem)}.toLowerCase();
+    const input = ${inputSelector ? `document.querySelector(${JSON.stringify(inputSelector)})` : "null"};
+    const root = input?.closest('form') || input?.parentElement?.parentElement || document;
     // Match the full filename, or the stem when it's distinctive enough that a
     // truncated chip ("my-long-na…") won't false-match generic UI text.
-    const candidates = Array.from(document.querySelectorAll('div,span,button,a,p,li,h1,h2,h3'));
+    const candidates = Array.from(root.querySelectorAll('div,span,button,a,p,li,h1,h2,h3'));
     let chipNamed = false;
     for (const el of candidates) {
       if (!(el instanceof HTMLElement)) continue;
@@ -246,7 +290,7 @@ export async function waitForAttachmentReady(
     }
     const uploadingSelectors = ${JSON.stringify(UPLOAD_STATUS_SELECTORS)};
     const uploading = uploadingSelectors.some((sel) => {
-      const nodes = Array.from(document.querySelectorAll(sel));
+      const nodes = Array.from(root.querySelectorAll(sel));
       return nodes.some((node) => {
         if (!(node instanceof HTMLElement)) return false;
         const ariaBusy = node.getAttribute('aria-busy');
@@ -258,14 +302,28 @@ export async function waitForAttachmentReady(
         return /\\buploading\\b/.test(text) || /\\bprocessing\\b/.test(text);
       });
     });
-    return { chipNamed, uploading };
+    const errorNodes = Array.from(
+      root.querySelectorAll('[role="alert"], [data-state="error"], [data-testid*="error"]')
+    );
+    const errorText = errorNodes
+      .filter((node) => node instanceof HTMLElement)
+      .map((node) => (node.textContent || '').trim())
+      .find((text) => /upload|file|attach|unsupported|failed|could not/i.test(text));
+    return { chipNamed, uploading, errorText };
   })()`;
 
   while (Date.now() < deadline) {
     const r = await runtime.evaluate({ expression, returnByValue: true });
     const v = r.result?.value as
-      | { chipNamed?: boolean; uploading?: boolean }
+      | { chipNamed?: boolean; uploading?: boolean; errorText?: string }
       | undefined;
+    if (v?.errorText) {
+      throw new RosettaUploadError(
+        `ChatGPT rejected attachment ${fileName}: ${v.errorText.slice(0, 240)}`,
+        "upload-failed",
+        attachment.path,
+      );
+    }
     if (v?.chipNamed && !v.uploading) {
       if (firstSeenAt === null) firstSeenAt = Date.now();
       if (Date.now() - firstSeenAt >= stableMs) return;
@@ -279,6 +337,7 @@ export async function waitForAttachmentReady(
     `Attachment ${fileName} did not become ready within ${Math.round(timeoutMs / 1000)} s. The page never rendered a chip naming the file — the upload may have been rejected (size, MIME, or model doesn't accept this file type) or the composer DOM changed.`,
     "upload-timeout",
     attachment.path,
+    true,
   );
 }
 
@@ -310,11 +369,9 @@ export async function resolveElementObjectId(
  * DOM node under a `__reactProps$<hash>` key; we walk a few ancestors because
  * the handler may live on a wrapper rather than the input itself.
  *
- * Resolves `true` once the handler is observed, or `false` on timeout. We return
- * `false` rather than throwing because by `timeoutMs` (15 s) the composer has
- * long since hydrated in any normal run, so setting files is safe regardless —
- * the heuristic is a guard against the early-set race, not a hard gate. See
- * COMPOSER_UPLOAD_READY_TIMEOUT_MS for why an early set is unrecoverable.
+ * Resolves `true` once the handler is observed, or `false` on timeout. A false
+ * result is a hard gate: callers must not set files on this page because the
+ * early-set mis-route described above is unrecoverable for the current load.
  */
 export async function waitForComposerUploadReady(
   runtime: ChromeClient["Runtime"],
@@ -396,7 +453,15 @@ export async function attachFiles(
     // Gate: do not set files until ChatGPT has wired the composer's onChange
     // handler, or the file mis-routes to /files/library and never attaches (an
     // unrecoverable state for the page load). See waitForComposerUploadReady.
-    await waitForComposerUploadReady(runtime, selector);
+    const composerReady = await waitForComposerUploadReady(runtime, selector);
+    if (!composerReady) {
+      throw new RosettaUploadError(
+        `ChatGPT's composer upload handler did not become ready within ${Math.round(COMPOSER_UPLOAD_READY_TIMEOUT_MS / 1000)} s. No file was injected; retrying in a fresh tab is safe.`,
+        "upload-timeout",
+        attachment.path,
+        true,
+      );
+    }
 
     const objectId = await resolveElementObjectId(runtime, selector);
     if (!objectId) {
@@ -414,10 +479,17 @@ export async function attachFiles(
         `DOM.setFileInputFiles failed for ${fileName}: ${err instanceof Error ? err.message : String(err)}`,
         "upload-failed",
         attachment.path,
+        true,
       );
     }
 
-    await waitForAttachmentReady(runtime, attachment, fileName);
+    await waitForAttachmentReady(
+      runtime,
+      attachment,
+      fileName,
+      DEFAULT_ATTACHMENT_READY_TIMEOUT_MS,
+      selector,
+    );
   }
 }
 

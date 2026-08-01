@@ -4,6 +4,11 @@ import {
   parseConversationSse,
   stripCitations,
 } from "../src/sse.js";
+import { isProStreamPhaseBoundaryEvent } from "../src/client.js";
+import {
+  evaluateProTurnCompletion,
+  type ConversationMapping,
+} from "../src/pro-final.js";
 
 function bodyFrom(chunks: string[]): AsyncIterable<Uint8Array> {
   const encoder = new TextEncoder();
@@ -18,6 +23,46 @@ async function collect(events: AsyncIterable<unknown>): Promise<unknown[]> {
   const result: unknown[] = [];
   for await (const event of events) result.push(event);
   return result;
+}
+
+const PRO_TURN = "1dc9731f-4ea1-442c-885a-1f83606dddc1";
+
+function assistantNode(
+  id: string,
+  parent: string | null,
+  contentType: string,
+  options: {
+    text?: string;
+    turn?: string;
+    reasoningStatus?: string;
+    finishType?: string;
+    recipient?: string;
+    endTurn?: boolean;
+  } = {},
+): ConversationMapping[string] {
+  return {
+    id,
+    parent,
+    children: [],
+    message: {
+      id,
+      author: { role: "assistant" },
+      recipient: options.recipient ?? "all",
+      content: {
+        content_type: contentType,
+        parts: options.text === undefined ? [] : [options.text],
+      },
+      status: "finished_successfully",
+      end_turn:
+        options.endTurn ?? (contentType === "text" || contentType === "reasoning_recap"),
+      metadata: {
+        turn_exchange_id: options.turn ?? PRO_TURN,
+        reasoning_status: options.reasoningStatus,
+        finish_details: options.finishType ? { type: options.finishType } : undefined,
+        model_slug: "gpt-5-6-pro",
+      },
+    },
+  };
 }
 
 describe("parseConversationSse", () => {
@@ -157,6 +202,160 @@ describe("aggregateAssistantMessage", () => {
     ]);
     const result = await aggregateAssistantMessage(parseConversationSse(body));
     expect(result.text).toBe("PINEAPPLE-9824");
+  });
+});
+
+describe("Pro turn final-state verification", () => {
+  test("A: rejects the observed short end_turn text while later thoughts are still reasoning", () => {
+    const mapping: ConversationMapping = {
+      "16ced1a1-139f-42b9-99c9-3758d40810f9": assistantNode(
+        "16ced1a1-139f-42b9-99c9-3758d40810f9",
+        null,
+        "text",
+        {
+          text: "12 个机制已展开；查重发现四类强近邻，候选将收窄到结构扩容、最小写集、非交换事件代数和条件纤维输运，并标高风险。",
+        },
+      ),
+      "f6544ce3-44ec-48b2-880d-386a6fa4cacb": assistantNode(
+        "f6544ce3-44ec-48b2-880d-386a6fa4cacb",
+        "16ced1a1-139f-42b9-99c9-3758d40810f9",
+        "thoughts",
+        { reasoningStatus: "is_reasoning", endTurn: false },
+      ),
+    };
+
+    expect(evaluateProTurnCompletion(mapping, PRO_TURN)).toMatchObject({
+      done: false,
+      reason: "trusted reasoning_ended signal not present",
+    });
+  });
+
+  test("B: message_stream_complete ends only the stream phase when mapping is still reasoning", () => {
+    const mapping: ConversationMapping = {
+      preamble: assistantNode("preamble", null, "text", { text: "先做检查。" }),
+      thoughts: assistantNode("thoughts", "preamble", "thoughts", {
+        reasoningStatus: "is_reasoning",
+        endTurn: false,
+      }),
+    };
+
+    expect(isProStreamPhaseBoundaryEvent({ type: "message_stream_complete" })).toBe(true);
+    expect(
+      isProStreamPhaseBoundaryEvent({ type: "message_marker", marker: "last_token" }),
+    ).toBe(true);
+    expect(evaluateProTurnCompletion(mapping, PRO_TURN).done).toBe(false);
+  });
+
+  test("D: rejects every end_turn stage text when reasoning continues afterward", () => {
+    const mapping: ConversationMapping = {
+      stage1: assistantNode("stage1", null, "text", { text: "阶段一。" }),
+      thoughts1: assistantNode("thoughts1", "stage1", "thoughts", {
+        reasoningStatus: "is_reasoning",
+        endTurn: false,
+      }),
+      stage2: assistantNode("stage2", "thoughts1", "text", { text: "阶段二。" }),
+      thoughts2: assistantNode("thoughts2", "stage2", "thoughts", {
+        reasoningStatus: "is_reasoning",
+        endTurn: false,
+      }),
+    };
+
+    expect(evaluateProTurnCompletion(mapping, PRO_TURN).done).toBe(false);
+  });
+
+  test("E: returns only the terminal text node after trusted reasoning_ended", () => {
+    const mapping: ConversationMapping = {
+      thoughts: assistantNode("thoughts", null, "thoughts", {
+        reasoningStatus: "is_reasoning",
+        endTurn: false,
+      }),
+      recap: assistantNode("recap", "thoughts", "reasoning_recap", {
+        reasoningStatus: "reasoning_ended",
+      }),
+      final: assistantNode("final", "recap", "text", {
+        text: "完整最终回答",
+        finishType: "stop",
+      }),
+    };
+
+    expect(evaluateProTurnCompletion(mapping, PRO_TURN)).toEqual({
+      done: true,
+      finalText: "完整最终回答",
+      finalMessageId: "final",
+      modelSlug: "gpt-5-6-pro",
+      finishReason: "stop",
+    });
+  });
+
+  test("rejects a terminal-looking text if newer is_reasoning thoughts follow it", () => {
+    const mapping: ConversationMapping = {
+      recap: assistantNode("recap", null, "reasoning_recap", {
+        reasoningStatus: "reasoning_ended",
+      }),
+      candidate: assistantNode("candidate", "recap", "text", {
+        text: "看似最终",
+        finishType: "stop",
+      }),
+      resumed: assistantNode("resumed", "candidate", "thoughts", {
+        reasoningStatus: "is_reasoning",
+        endTurn: false,
+      }),
+    };
+
+    expect(evaluateProTurnCompletion(mapping, PRO_TURN)).toMatchObject({
+      done: false,
+      reason: "active or graph-incomparable reasoning remains for final text candidate",
+    });
+  });
+
+  test("G: ignores completed and active nodes from different turn_exchange_ids", () => {
+    const mapping: ConversationMapping = {
+      oldRecap: assistantNode("oldRecap", null, "reasoning_recap", {
+        turn: "previous-turn",
+        reasoningStatus: "reasoning_ended",
+      }),
+      oldFinal: assistantNode("oldFinal", "oldRecap", "text", {
+        turn: "previous-turn",
+        text: "上一轮答案",
+        finishType: "stop",
+      }),
+      currentThoughts: assistantNode("currentThoughts", "oldFinal", "thoughts", {
+        reasoningStatus: "is_reasoning",
+        endTurn: false,
+      }),
+      currentRecap: assistantNode("currentRecap", "currentThoughts", "reasoning_recap", {
+        reasoningStatus: "reasoning_ended",
+      }),
+      currentFinal: assistantNode("currentFinal", "currentRecap", "text", {
+        text: "当前轮完整答案",
+        finishType: "stop",
+      }),
+      nextThoughts: assistantNode("nextThoughts", "currentFinal", "thoughts", {
+        turn: "next-turn",
+        reasoningStatus: "is_reasoning",
+        endTurn: false,
+      }),
+    };
+
+    expect(evaluateProTurnCompletion(mapping, PRO_TURN)).toMatchObject({
+      done: true,
+      finalText: "当前轮完整答案",
+      finalMessageId: "currentFinal",
+    });
+  });
+
+  test("H: instant aggregation still succeeds without Pro reasoning metadata", async () => {
+    const body = bodyFrom([
+      'data: {"message":{"id":"instant","author":{"role":"assistant"},"recipient":"all","content":{"content_type":"text","parts":["instant final"]},"status":"finished_successfully","end_turn":true},"conversation_id":"instant-conv"}\n\n',
+      "data: [DONE]\n\n",
+    ]);
+
+    const result = await aggregateAssistantMessage(parseConversationSse(body));
+    expect(result).toMatchObject({
+      text: "instant final",
+      conversationId: "instant-conv",
+      messageId: "instant",
+    });
   });
 });
 

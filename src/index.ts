@@ -48,6 +48,13 @@ export {
   stripCitations,
 } from "./sse.js";
 export {
+  evaluateProTurnCompletion,
+  type ConversationMapping,
+  type ConversationMappingMessage,
+  type ConversationMappingNode,
+  type ProTurnCompletion,
+} from "./pro-final.js";
+export {
   RosettaUploadError,
   MAX_DATA_TRANSFER_BYTES,
 } from "./upload.js";

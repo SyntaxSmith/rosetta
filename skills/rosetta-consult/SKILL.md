@@ -25,22 +25,44 @@ Tool: `mcp__rosetta__consult` (one tool, returns assistant text only — no file
 
 - Anything you can answer correctly yourself — consult costs a Chrome tab + focus mutex and slows down parallel work.
 - Code edits, file ops, running commands — consult only returns text.
-- A back-and-forth chat — each call is a one-shot Q→A; structure your prompts so a single answer is useful.
+- Routine questions that do not benefit from an external second opinion.
 
 ## Threading model
 
-Each MCP server process is one implicit conversation. Back-to-back `consult` calls in the same Claude Code session keep multi-turn context automatically. Knobs:
+Each MCP server process is one implicit conversation. Back-to-back `consult`
+calls in the same host agent keep multi-turn context automatically.
 
-- default (no flags) → continue the implicit session conversation.
-- `fresh: true` → start a new conversation (becomes the new session default). Use when switching topic so prior context doesn't bleed.
+- **Default (no threading flags) → continue the implicit session conversation.**
+  Prefer this aggressively: follow-up questions, revisions, new evidence, related
+  subtasks, alternative designs, and critique of an earlier answer all belong in
+  the existing conversation. Do not pass `fresh` merely because the next prompt
+  is self-contained or because this is another tool call.
+- `fresh: true` → start a new conversation, which becomes the new session
+  default. Use it only when at least one of these is true:
+  1. the problem is genuinely unrelated and earlier context has no value;
+  2. an independent adversarial/zero-context assessment is required;
+  3. the current conversation is already very long, confused, or contaminated;
+  4. the user explicitly asks for a new conversation.
 - `recall: "<name>"` → ignore implicit session, route through a named disk-persisted thread. Different names = parallel contexts that survive restarts.
 - `fresh: true` + `recall: "<name>"` → reset that named thread.
+
+The implicit conversation is scoped to one MCP server process. Codex
+subagents/agent threads may each own a different process even when they belong
+to the same user task. When context must cross agent boundaries, host restarts,
+or separate sessions, choose one stable descriptive `recall` name and reuse it;
+do not compensate by repeatedly creating fresh conversations.
 
 ## Prompt patterns
 
 - **Pro reasoning**: include the full problem statement, the constraints, and what kind of answer you want (proof? plan? code sketch?). Pro thinks harder when goals are explicit.
 - **Cross-check**: paste your candidate answer + ask "find errors or confirm correctness, be specific."
 - **Recall thread**: first call sets context ("we're working on X, here's the setup"); subsequent calls assume prior turns are remembered — don't re-paste.
+
+## Response integrity
+
+- Rosetta is expected to block until the backend Pro turn is verifiably complete. A short preamble or stage summary that plainly fails the requested output contract must be treated as **incomplete**, even if it looks polished or carries success-like metadata.
+- Do not send a follow-up into that conversation until the original backend turn is confirmed complete. Report the incomplete/error state first; a follow-up can otherwise branch from an internal thoughts/code node and contaminate the named thread.
+- This is a defensive caller check, not the completion mechanism. MCP transport and conversation-mapping verification remain responsible for returning only the full final answer.
 
 ## Prerequisite
 
