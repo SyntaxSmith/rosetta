@@ -30,6 +30,7 @@
  * # Configuration via env
  *   ROSETTA_CDP_PORT  — CDP debug port of the auth-holder Chrome (default 9222)
  *   ROSETTA_CDP_HOST  — CDP debug host (default 127.0.0.1)
+ *   ROSETTA_TIMEOUT_MS — wall-clock cap per call in ms (default 60 min, 0 disables)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -46,10 +47,14 @@ import {
 } from "../src/index.js";
 
 const SERVER_NAME = "rosetta";
-const SERVER_VERSION = "0.3.2";
+const SERVER_VERSION = "0.3.3";
 
 const port = Number(process.env["ROSETTA_CDP_PORT"] ?? 9222);
 const host = process.env["ROSETTA_CDP_HOST"] ?? "127.0.0.1";
+
+// Optional wall-clock override passed through to runConversation.
+const timeoutEnv = Number(process.env["ROSETTA_TIMEOUT_MS"]);
+const timeoutMs = Number.isFinite(timeoutEnv) && timeoutEnv >= 0 ? timeoutEnv : undefined;
 
 // Per-MCP-server-process conversation pointer. Lives in memory only —
 // process exit = clean reset. Cross-process persistence is opt-in via the
@@ -136,8 +141,39 @@ server.registerTool(
         ),
     },
   },
-  async (args) => {
+  async (args, extra) => {
     const cdp = await openSession({ port, host });
+
+    // Progress heartbeat. MCP hosts abort calls whose server stays silent too
+    // long — Claude Code's stdio idle watchdog defaults to 30 min, which plain
+    // Pro CoT can exceed. Emitting notifications/progress every minute keeps
+    // the call alive and surfaces elapsed-time/char-count updates to the host
+    // UI. No-ops when the host sent no progressToken.
+    const progressToken = extra._meta?.progressToken;
+    const startedAt = Date.now();
+    let streamedChars = 0;
+    const sendProgress = (message: string): void => {
+      if (progressToken === undefined) return;
+      void extra
+        .sendNotification({
+          method: "notifications/progress",
+          params: {
+            progressToken,
+            progress: Math.round((Date.now() - startedAt) / 1000),
+            message,
+          },
+        })
+        .catch(() => undefined);
+    };
+    const heartbeat = setInterval(() => {
+      const minutes = Math.round((Date.now() - startedAt) / 60_000);
+      sendProgress(
+        streamedChars > 0
+          ? `streaming answer… ${minutes} min elapsed, ${streamedChars} chars so far`
+          : `ChatGPT is thinking… ${minutes} min elapsed`,
+      );
+    }, 60_000);
+
     try {
       const model = args.model ?? "gpt-5-6-pro";
       const usingNamedThread = typeof args.recall === "string" && args.recall.length > 0;
@@ -183,6 +219,10 @@ server.registerTool(
         // Always keep the conversation alive — both named threads and the
         // session thread want to chain into future calls.
         keepConversation: true,
+        timeoutMs,
+        onChunk: (delta) => {
+          streamedChars += delta.length;
+        },
       });
 
       // Update the in-memory session pointer if this call participated in
@@ -228,6 +268,7 @@ server.registerTool(
         isError: true,
       };
     } finally {
+      clearInterval(heartbeat);
       await cdp.close();
     }
   },

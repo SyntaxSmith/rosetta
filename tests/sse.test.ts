@@ -287,6 +287,57 @@ describe("Pro turn final-state verification", () => {
     });
   });
 
+  test("minimal turn with absent finish_details verifies (captured 2026-08: trivial Pro prompt)", () => {
+    // Real mapping from a live gpt-5-6-pro "reply pong" turn: user → tool →
+    // reasoning_recap(reasoning_ended) → text, where the terminal text carries
+    // NO finish_details object. Requiring finish_details.type === "stop" made
+    // every such turn poll to the idle floor and fail as INCOMPLETE.
+    const mapping: ConversationMapping = {
+      user: {
+        id: "user",
+        parent: null,
+        children: [],
+        message: {
+          id: "user",
+          author: { role: "user" },
+          recipient: "all",
+          content: { content_type: "text", parts: ["Reply with exactly one word: pong"] },
+          status: "finished_successfully",
+          end_turn: null,
+          metadata: { turn_exchange_id: PRO_TURN },
+        },
+      },
+      recap: assistantNode("recap", "user", "reasoning_recap", {
+        reasoningStatus: "reasoning_ended",
+      }),
+      final: assistantNode("final", "recap", "text", { text: "pong" }),
+    };
+
+    expect(evaluateProTurnCompletion(mapping, PRO_TURN)).toMatchObject({
+      done: true,
+      finalText: "pong",
+      finalMessageId: "final",
+      finishReason: undefined,
+    });
+  });
+
+  test("explicit non-stop finish_details still disqualifies the terminal text", () => {
+    const mapping: ConversationMapping = {
+      recap: assistantNode("recap", null, "reasoning_recap", {
+        reasoningStatus: "reasoning_ended",
+      }),
+      final: assistantNode("final", "recap", "text", {
+        text: "被截断",
+        finishType: "max_tokens",
+      }),
+    };
+
+    expect(evaluateProTurnCompletion(mapping, PRO_TURN)).toMatchObject({
+      done: false,
+      reason: "no terminal recipient=all text after trusted reasoning_ended",
+    });
+  });
+
   test("rejects a terminal-looking text if newer is_reasoning thoughts follow it", () => {
     const mapping: ConversationMapping = {
       recap: assistantNode("recap", null, "reasoning_recap", {

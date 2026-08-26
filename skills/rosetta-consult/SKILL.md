@@ -16,7 +16,7 @@ Tool: `mcp__rosetta__consult` (one tool, returns assistant text only — no file
 
 ## When to call
 
-- Hard reasoning, math derivations, proof checks, tricky algorithm design → default Pro (30 s – 15 min, blocks the call).
+- Hard reasoning, math derivations, proof checks, tricky algorithm design → default Pro (30 s – 15+ min, blocks the call; the MCP server heartbeats progress so hour-long runs survive host idle timeouts).
 - Brainstorming, design alternatives, naming, writing feedback → default Pro too; Pro's breadth is what you're paying the latency for.
 - Cross-checking your own answer when stakes are high → default Pro.
 - Long-running research context that must survive across tool calls / MCP restarts → `recall: "<topic>"` (disk-persisted thread at `~/.rosetta/state.json`).

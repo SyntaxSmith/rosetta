@@ -200,7 +200,7 @@ describe("production DOM.setFileInputFiles path", () => {
           return { result: { objectId: "file-input-1" } };
         }
         if (params.expression.includes("let chipNamed = false")) {
-          return { result: { value: { chipNamed: true, uploading: false } } };
+          return { result: { value: { chipNamed: true, uploading: false, sendEnabled: true } } };
         }
         throw new Error(`Unexpected Runtime.evaluate: ${params.expression.slice(0, 80)}`);
       },

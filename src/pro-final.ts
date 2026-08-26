@@ -92,11 +92,16 @@ export function evaluateProTurnCompletion(
 
   const terminalTexts = turnMessages.filter(({ message }) => {
     const parts = message.content?.parts;
+    const finishType = message.metadata?.finish_details?.type;
     return message.content?.content_type === "text" &&
       message.recipient === "all" &&
       message.status === "finished_successfully" &&
       message.end_turn === true &&
-      message.metadata?.finish_details?.type === "stop" &&
+      // finish_details is absent entirely on minimal Pro turns (observed
+      // 2026-08: trivial prompts produce end_turn=true + finished_successfully
+      // with no finish_details object). Absent is fine; an explicit non-stop
+      // type (max_tokens, …) still disqualifies.
+      (finishType === "stop" || finishType === undefined) &&
       typeof message.id === "string" &&
       message.id.length > 0 &&
       Array.isArray(parts) &&

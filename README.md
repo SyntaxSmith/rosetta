@@ -251,6 +251,12 @@ cp -r skills/rosetta-consult ~/.claude/skills/
 |---|---|---|
 | `ROSETTA_CDP_PORT` | `9222` | CDP debug port of the auth-holder Chrome |
 | `ROSETTA_CDP_HOST` | `127.0.0.1` | CDP debug host |
+| `ROSETTA_TIMEOUT_MS` | `3600000` | Wall-clock cap per call in ms (0 disables) |
+
+The MCP server emits `notifications/progress` once a minute while a call runs
+(elapsed time + streamed chars). This matters for hosts with idle watchdogs —
+Claude Code aborts stdio tool calls that stay silent for 30 min, which plain
+Pro CoT can exceed — and shows live progress in the host UI.
 
 ### Claude Code
 

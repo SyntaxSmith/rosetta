@@ -1555,6 +1555,7 @@ export async function pollConversationForFinal(
   let lastTurnSignature = "";
   let lastVerificationReason = "conversation mapping not fetched yet";
   let lastProgressAt = Date.now();
+  let consecutiveCdpFailures = 0;
 
   // Polling has no WS-heartbeat liveness — the only "progress" signal is a new
   // turn node landing in the mapping. Pro routinely goes silent for 2+ minutes
@@ -1592,6 +1593,24 @@ export async function pollConversationForFinal(
       });
     } catch (err) {
       dbg("poll fetch error", { err: String(err) });
+      // Only a dead CDP socket (the auth-holder tab was closed mid-run — the
+      // ws error fires on every call and never recovers, and the turn itself
+      // was aborted server-side with the tab) justifies failing fast. In-page
+      // fetch network blips are ordinary transient errors: keep retrying
+      // against the idle floor as before.
+      if (isCdpSocketClosed(err)) {
+        consecutiveCdpFailures += 1;
+        if (consecutiveCdpFailures >= 2) {
+          throw new RosettaRequestError(
+            `Conversation polling transport is closed (${String(err)}). The Chrome tab backing ` +
+              "this session was likely closed — the Pro turn is aborted server-side and cannot be " +
+              "recovered by this call.",
+            0,
+            undefined,
+            "server",
+          );
+        }
+      }
       lastVerificationReason = `conversation GET failed: ${String(err)}`;
       if (effectiveIdleMs > 0 && Date.now() - lastProgressAt > effectiveIdleMs) {
         throw pollingIncompleteError(
@@ -1603,6 +1622,7 @@ export async function pollConversationForFinal(
       await sleep(intervalMs, signal);
       continue;
     }
+    consecutiveCdpFailures = 0;
     eventCount += 1;
     if (resp.status === 200) {
       const body = resp.body as { mapping?: ConversationMapping };
@@ -1686,6 +1706,11 @@ export async function pollConversationForFinal(
     }
     await sleep(intervalMs, signal);
   }
+}
+
+/** True when an httpRequest error is the chrome-remote-interface "CDP socket is closed" throw — a state that never recovers within a call. */
+function isCdpSocketClosed(err: unknown): boolean {
+  return err instanceof Error && /WebSocket is not open/i.test(err.message);
 }
 
 function pollingIncompleteError(

@@ -8,7 +8,7 @@ import { FILE_INPUT_SELECTORS, UPLOAD_STATUS_SELECTORS } from "./upload.constant
 export const MAX_DATA_TRANSFER_BYTES = 20 * 1024 * 1024;
 
 /** Default time we'll wait for the page's React pipeline to render a chip naming the file. */
-const DEFAULT_ATTACHMENT_READY_TIMEOUT_MS = 60_000;
+const DEFAULT_ATTACHMENT_READY_TIMEOUT_MS = 90_000;
 
 /**
  * How long to wait for ChatGPT's composer to wire its file-input `onChange`
@@ -264,9 +264,15 @@ export async function waitForAttachmentReady(
   //       the filename (or its stem). This is the upload-actually-happened
   //       proof: ChatGPT only renders the filename once the file is in the
   //       composer's attachment list.
-  //   (2) !uploading — no aria-busy / data-state=uploading / "Uploading…"|
-  //       "Processing…" indicator in flight (else the send button stays
-  //       disabled and we'd race into a swallowed send).
+  //   (2) sendEnabled — the composer's send button is enabled. Observed 2026-08
+  //       (post file-tile redesign): while an upload is processing, the send
+  //       button stays disabled and NONE of UPLOAD_STATUS_SELECTORS matches
+  //       anything — the old "uploading indicator" signals are gone from the
+  //       DOM. The button is now the only reliable in-flight gate; skipping it
+  //       made us type+click-send mid-upload, which on slow uploads exceeded
+  //       the send-click window and failed the whole turn with trigger-failed.
+  //   (3) !uploading — legacy indicator sweep, kept for DOM revisions that
+  //       still render explicit status nodes.
   const stem = path.basename(fileName, path.extname(fileName));
   const expression = `(() => {
     const name = ${JSON.stringify(fileName)}.toLowerCase();
@@ -309,13 +315,20 @@ export async function waitForAttachmentReady(
       .filter((node) => node instanceof HTMLElement)
       .map((node) => (node.textContent || '').trim())
       .find((text) => /upload|file|attach|unsupported|failed|could not/i.test(text));
-    return { chipNamed, uploading, errorText };
+    const sendBtn =
+      document.querySelector('button[data-testid="send-button"]') ||
+      Array.from(document.querySelectorAll('button[aria-label]')).find((b) =>
+        /send/i.test(b.getAttribute('aria-label') || '')
+      );
+    const sendEnabled =
+      !!sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true';
+    return { chipNamed, uploading, sendEnabled, errorText };
   })()`;
 
   while (Date.now() < deadline) {
     const r = await runtime.evaluate({ expression, returnByValue: true });
     const v = r.result?.value as
-      | { chipNamed?: boolean; uploading?: boolean; errorText?: string }
+      | { chipNamed?: boolean; uploading?: boolean; sendEnabled?: boolean; errorText?: string }
       | undefined;
     if (v?.errorText) {
       throw new RosettaUploadError(
@@ -324,7 +337,7 @@ export async function waitForAttachmentReady(
         attachment.path,
       );
     }
-    if (v?.chipNamed && !v.uploading) {
+    if (v?.chipNamed && !v.uploading && v.sendEnabled) {
       if (firstSeenAt === null) firstSeenAt = Date.now();
       if (Date.now() - firstSeenAt >= stableMs) return;
     } else {
@@ -334,7 +347,9 @@ export async function waitForAttachmentReady(
   }
 
   throw new RosettaUploadError(
-    `Attachment ${fileName} did not become ready within ${Math.round(timeoutMs / 1000)} s. The page never rendered a chip naming the file — the upload may have been rejected (size, MIME, or model doesn't accept this file type) or the composer DOM changed.`,
+    `Attachment ${fileName} did not become ready within ${Math.round(timeoutMs / 1000)} s — ` +
+      `either the composer never rendered a chip naming the file (upload rejected: size, MIME, or ` +
+      `unsupported type) or the send button never enabled (upload stuck processing).`,
     "upload-timeout",
     attachment.path,
     true,
