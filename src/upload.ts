@@ -176,11 +176,11 @@ export async function transferAttachmentViaDataTransfer(
 /**
  * Search the page for the composer's file-input element. ChatGPT currently
  * exposes several file inputs (composer attachments, photo upload, avatar,
- * etc.), so selector order alone is not enough. We rank every match using
- * composer/form proximity, React handler presence, multiplicity, and accept
- * type, then mark the winning node with a per-call data attribute. Returning
- * that exact marker selector prevents a later `document.querySelector` from
- * resolving a different node matched by the same broad fallback selector.
+ * etc.), so selector order alone is not enough. We discard inputs outside the
+ * form that owns the prompt editor, then rank the remaining matches using React
+ * handler presence, multiplicity, and accept type. The winning node gets a
+ * per-call data attribute so a later `document.querySelector` cannot resolve a
+ * different node matched by the same broad fallback selector.
  */
 export async function findFileInputSelector(
   runtime: ChromeClient["Runtime"],
@@ -209,9 +209,11 @@ export async function findFileInputSelector(
         const composerLike = Boolean(
           form?.querySelector('textarea, [contenteditable="true"], #prompt-textarea')
         );
-        let score = 0;
-        if (composerLike) score += 200;
-        else if (form) score += 80;
+        // During /c/<id> navigation, photo/camera inputs mount before the
+        // conversation composer. Injecting a document into either one is
+        // silently ignored, so wait for an input owned by the actual composer.
+        if (!composerLike) continue;
+        let score = 200;
         if (hasReactHandler(el)) score += 100;
         if (el.multiple) score += 30;
         if (!accept) score += 40;
@@ -456,12 +458,23 @@ export async function attachFiles(
     }
     const fileName = path.basename(absPath);
 
-    const selector = await findFileInputSelector(runtime);
+    // Existing-conversation routes fire `load` before React mounts the unified
+    // composer. At that point only photo/camera file inputs exist, and choosing
+    // one silently discards document attachments. Poll until the real composer
+    // input appears rather than treating those early inputs as candidates.
+    const selectorDeadline = Date.now() + COMPOSER_UPLOAD_READY_TIMEOUT_MS;
+    let selector: string | null = null;
+    while (Date.now() < selectorDeadline) {
+      selector = await findFileInputSelector(runtime);
+      if (selector) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    }
     if (!selector) {
       throw new RosettaUploadError(
-        `Could not locate a file input on the ChatGPT page. The composer DOM may have changed; consider updating FILE_INPUT_SELECTORS.`,
-        "upload-failed",
+        `Could not locate the ChatGPT composer file input within ${Math.round(COMPOSER_UPLOAD_READY_TIMEOUT_MS / 1000)} s. No file was injected; retrying in a fresh tab is safe.`,
+        "upload-timeout",
         attachment.path,
+        true,
       );
     }
 
