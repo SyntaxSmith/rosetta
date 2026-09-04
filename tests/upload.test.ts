@@ -181,6 +181,7 @@ describe("production DOM.setFileInputFiles path", () => {
     expect(captures[0]!.expression).toContain("candidates.sort");
     expect(captures[0]!.expression).toContain("data-rosetta-file-input");
     expect(captures[0]!.expression).toContain("composerLike");
+    expect(captures[0]!.expression).toContain("if (!composerLike) continue");
   });
 
   test("sets the file only after the React upload handler is ready", async () => {
@@ -220,6 +221,47 @@ describe("production DOM.setFileInputFiles path", () => {
     expect(setFileInputFiles).toHaveBeenCalledWith({
       files: [fixturePath],
       objectId: "file-input-1",
+    });
+  });
+
+  test("waits for the conversation composer input to mount before injecting", async () => {
+    const fixturePath = path.join(tempDir, "second-turn.md");
+    writeFileSync(fixturePath, "second turn");
+    const exactSelector = '[data-rosetta-file-input="rosetta-second-turn"]';
+    let discoveryCalls = 0;
+
+    const runtime = {
+      async evaluate(params: CapturedEval) {
+        if (params.expression.includes("const selectors =")) {
+          discoveryCalls += 1;
+          return { result: { value: discoveryCalls === 1 ? null : exactSelector } };
+        }
+        if (params.expression.includes("k.startsWith('__reactProps$')")) {
+          return { result: { value: true } };
+        }
+        if (params.returnByValue === false) {
+          return { result: { objectId: "file-input-2" } };
+        }
+        if (params.expression.includes("let chipNamed = false")) {
+          return { result: { value: { chipNamed: true, uploading: false, sendEnabled: true } } };
+        }
+        throw new Error(`Unexpected Runtime.evaluate: ${params.expression.slice(0, 80)}`);
+      },
+    };
+    const setFileInputFiles = vi.fn(async () => undefined);
+
+    await attachFiles(
+      {
+        Runtime: runtime,
+        DOM: { setFileInputFiles },
+      } as unknown as Parameters<typeof attachFiles>[0],
+      [{ path: fixturePath }],
+    );
+
+    expect(discoveryCalls).toBe(2);
+    expect(setFileInputFiles).toHaveBeenCalledWith({
+      files: [fixturePath],
+      objectId: "file-input-2",
     });
   });
 
