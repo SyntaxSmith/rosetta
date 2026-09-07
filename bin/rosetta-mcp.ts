@@ -86,15 +86,15 @@ server.registerTool(
         .boolean()
         .optional()
         .describe(
-          "Force ChatGPT Pro (gpt-5-6-pro). Redundant — Pro is already the default; " +
+          "Force ChatGPT Pro (gpt-6-pro). Redundant — Pro is already the default; " +
             "kept for backward compatibility.",
         ),
       model: z
         .string()
         .optional()
         .describe(
-          "Explicit model slug (overrides `pro`). Default `gpt-5-6-pro`. Cheaper tiers: " +
-            "`gpt-5-6-thinking` (thinking), `gpt-5-6` (base), `gpt-5-5` (the UI's fast lane).",
+          "Explicit model slug (overrides `pro`). Default `gpt-6-pro` (GPT-6 Pro). Cheaper " +
+            "tiers: `gpt-5-6-thinking` (thinking), `gpt-5-6` (base), `gpt-5-5-pro` (legacy Pro).",
         ),
       thinkingEffort: z
         .string()
@@ -175,7 +175,7 @@ server.registerTool(
     }, 60_000);
 
     try {
-      const model = args.model ?? "gpt-5-6-pro";
+      const model = args.model ?? "gpt-6-pro";
       const usingNamedThread = typeof args.recall === "string" && args.recall.length > 0;
 
       // If `fresh` is set, wipe whichever thread we'd otherwise carry forward.

@@ -897,30 +897,31 @@ function rewriteBody(body: Record<string, unknown>, input: RunConversationInput)
 }
 
 // The composer carries a `thinking_effort` field in the `/f/conversation`
-// body, *separate* from the `model` slug — it encodes the "智能" level. The
-// 2026-07 GPT-5.6 ("Sol") selector is two-axis: a model-family sub-menu
-// (GPT-5.6 Sol / GPT-5.5 / GPT-5.4 / GPT-5.3 / o3) × an effort lane. Captured
-// per lane (via Fetch-abort captures, family = GPT-5.6 Sol unless noted):
-//   极速  → model gpt-5-5           thinking_effort absent  (no 5.6 fast lane!)
-//   中    → model gpt-5-6-thinking  thinking_effort "standard"
-//   高    → model gpt-5-6-thinking  thinking_effort "extended"
-//   极高  → model gpt-5-6-thinking  thinking_effort "max"
-//   Pro   → model gpt-5-6-pro       thinking_effort "standard"
-//   Pro (family GPT-5.5) → gpt-5-5-pro + "extended" (the old 标准/扩展 depth
-//   survives per-family; 5.6 Pro has no 扩展 entry and sends "standard").
-// The page builds the outgoing body from the account's composer default lane,
-// so pinning a different-lane model would leak that lane's effort and mismatch
-// — e.g. a plain instant request inheriting extended thinking (an instant
-// `pong` measured 28s → 13s once stripped). Realign to the pinned model's
-// lane: -pro slugs get their family's UI value; everything else drops the
-// field so the backend applies that model's natural default. Override via
-// `input.thinkingEffort` — e.g. `"max"` on gpt-5-6-thinking for the 极高 lane.
+// body, *separate* from the `model` slug — it encodes the "能力" level. The
+// 2026-09 picker is a single popover (`composer-intelligence-picker-content`)
+// with a 5-position 能力 slider plus model-family radios (最新 / GPT-5.6 Sol /
+// GPT-5.5). Captured per lane (Fetch-abort, family = 最新 unless noted):
+//   即时  → model gpt-5-6            thinking_effort absent
+//   中    → model gpt-5-6-thinking   thinking_effort "standard"
+//   高    → model gpt-5-6-thinking   thinking_effort "extended"
+//   极高  → model gpt-5-6-thinking   thinking_effort "max"
+//   Pro   → model gpt-6-pro          thinking_effort "standard"  (GPT-6 era)
+//   Pro (family GPT-5.5) → gpt-5-5-pro + "extended" (legacy per-family depth)
+// The page builds the outgoing body from the account's composer default lane.
+// Since the 2026-09 redesign that default is 即时 (gpt-5-6, no effort field),
+// but an account defaulted to a thinking lane would leak that lane's effort
+// onto a differently-pinned model — e.g. a plain instant request inheriting
+// extended thinking (an instant `pong` measured 28s → 13s once stripped).
+// Realign to the pinned model's lane: -pro slugs get their family's UI value
+// (emitted even when the page omitted the field, matching the Pro lane wire);
+// everything else drops the field so the backend applies that model's natural
+// default. Override via `input.thinkingEffort` — e.g. `"max"` on
+// gpt-5-6-thinking for the 极高 lane.
 function alignThinkingEffort(body: Record<string, unknown>, input: RunConversationInput): void {
   if (input.thinkingEffort !== undefined) {
     body.thinking_effort = input.thinkingEffort;
     return;
   }
-  if (!("thinking_effort" in body)) return;
   const model = input.model ?? "";
   if (/-pro$/.test(model)) {
     body.thinking_effort = model === "gpt-5-5-pro" ? "extended" : "standard";
@@ -1471,9 +1472,11 @@ export async function streamSecondLeg(
     });
     const setupVal = setupRes.result?.value;
     if (setupVal && typeof setupVal === "object" && (setupVal as { __err: string }).__err) {
-      // ChatGPT moved the Pro streaming endpoint behind a stricter handshake
-      // (2026-05) — `wss://ws.chatgpt.com/p2/ws/user/...` answers 403 even to
-      // the first-party page. The new messages ship `poll_interval_ms` and
+      // 2026-05: ChatGPT moved the Pro streaming endpoint behind a stricter
+      // handshake — `wss://ws.chatgpt.com/p2/ws/user/...` answered 403 even to
+      // the first-party page. (2026-09: celsius now hands out `/p0/` URLs and
+      // the in-page WS connects cleanly, so this branch is again rare.) The
+      // messages ship `poll_interval_ms` and
       // `poll_on_websocket_inactivity_ms` in metadata, so the supported
       // recovery is to poll /backend-api/conversation/<id> until the final
       // assistant text appears. Do that here so the call returns the answer
@@ -1529,10 +1532,12 @@ export async function streamSecondLeg(
  * Pro fallback: poll /backend-api/conversation/<id> until the assistant
  * message for our turn finalizes, then return it as a RunConversationResult.
  * Used when the page-side WebSocket can't open (ChatGPT's 2026-05 change made
- * `wss://ws.chatgpt.com/p2/ws/user/...` reject every connection with 403, and
- * the new server-side response now ships `poll_interval_ms` +
+ * `wss://ws.chatgpt.com/p2/ws/user/...` reject every connection with 403;
+ * 2026-09 the celsius endpoint returns `/p0/` URLs and the WS works again —
+ * this stays as the recovery for genuine handshake failures, and as the
+ * mandatory post-stream verifier). Server responses ship `poll_interval_ms` +
  * `poll_on_websocket_inactivity_ms` in message metadata as the prescribed
- * recovery).
+ * recovery cadence.
  *
  * Resolution requires `evaluateProTurnCompletion` to prove the exact current
  * turn has a trusted reasoning_ended recap followed by its terminal text.

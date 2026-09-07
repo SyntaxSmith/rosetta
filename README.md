@@ -10,7 +10,7 @@ Programmatic access to **ChatGPT (incl. Pro)** from Node, by translating between
 
 ## What it does
 
-- **Pro support**: `runConversation({ model: "gpt-5-6-pro", ... })` follows the `stream_handoff` event, opens the WebSocket second leg, and aggregates the live CoT until `message_stream_complete` — same UX as the chatgpt.com UI but returnable from Node.
+- **Pro support**: `runConversation({ model: "gpt-6-pro", ... })` follows the `stream_handoff` event, opens the WebSocket second leg, and aggregates the live CoT until `message_stream_complete` — same UX as the chatgpt.com UI but returnable from Node.
 - **Instant models too**: non-Pro slugs (`gpt-5-6` default; `gpt-5-5` is the web UI's 极速 lane) return in seconds via the same path.
 - **Multi-turn**: pass `conversationId` + `parentMessageId` (or use `recall: "thread"` for persistence).
 - **Concurrency**: each call spawns its own tab; many calls can stream in parallel.
@@ -66,7 +66,7 @@ Sign in once; the profile persists. Subsequent runs reuse the cookies.
 ## CLI
 
 ```bash
-# default = Pro (gpt-5-6-pro)
+# default = Pro (gpt-6-pro, GPT-6)
 rosetta run "Explain idempotent matrices in three sentences."
 
 # cheaper tier via explicit slug
@@ -104,16 +104,16 @@ const session = await openSession({ port: 9222 });
 // One-shot
 const result = await runConversation(session, {
   prompt: "What's the area of a triangle with sides 3, 4, 5?",
-  model: "gpt-5-6-pro",        // Pro
+  model: "gpt-6-pro",           // Pro (GPT-6)
 });
 console.log(result.text);       // "6"
-console.log(result.modelSlug);  // "gpt-5-6-pro"
+console.log(result.modelSlug);  // "gpt-6-pro"
 console.log(result.tookMs);     // ~30000 for trivial prompts
 
 // Streaming
 await runConversation(
   session,
-  { prompt: "...", model: "gpt-5-6-pro" },
+  { prompt: "...", model: "gpt-6-pro" },
   { onChunk: (delta) => process.stdout.write(delta) },
 );
 
@@ -140,7 +140,7 @@ const r3 = await runConversation(session, {
 // Multiple files (sequential, fail-fast) + Pro for harder tasks.
 await runConversation(session, {
   prompt: "Cross-reference these two PDFs and list contradictions.",
-  model: "gpt-5-6-pro",
+  model: "gpt-6-pro",
   attachments: [
     { path: "./paper-v1.pdf" },
     { path: "./paper-v2.pdf" },
@@ -202,7 +202,7 @@ rosetta ships an MCP server (`rosetta-mcp` binary) that speaks Model Context Pro
 ```
 consult({
   prompt:           string,    // required
-  pro?:             boolean,   // redundant — gpt-5-6-pro is already the default
+  pro?:             boolean,   // redundant — gpt-6-pro is already the default
   model?:           string,    // explicit slug (overrides `pro`)
   thinkingEffort?:  string,    // "standard" | "extended" | "max" (the UI's 中/高/极高 lanes)
   fresh?:           boolean,   // start a new conversation (see "Conversation model" below)
@@ -345,8 +345,8 @@ Run `pnpm build` in the rosetta repo first so `dist/` exists.
 
 ## Caveats
 
-- ChatGPT's wire shapes shift periodically. The implementation tracks the protocol as of **2026-07** (model lineup is GPT-5.6: instant default `gpt-5-6`, plus `gpt-5-6-thinking` and `gpt-5-6-pro` — the latter two hidden from `/backend-api/models`; bootstrap SSE emits `stream_handoff`; second-leg WS uses `encoded_item` chunks; send pipeline interleaves `/conversation/init`, `/f/conversation/prepare`, `/sentinel/chat-requirements`, autocompletions, and analytics before the actual `/f/conversation` POST — observed click-to-send latency commonly 15–25 s on multi-turn Pro, so we wait for `prepare` as the "click landed" signal rather than redoing). Wire-shape regressions are caught by a captured-frame replay test.
-- **Reasoning level (`thinking_effort`)**: the composer splits the picker into a model family (GPT-5.6 Sol / GPT-5.5 / … / o3) *and* an intelligence lane, the latter sent as a `thinking_effort` body field. Captured lane mapping (2026-07, family GPT-5.6 Sol): 极速 → `gpt-5-5` (no effort field), 中/高/极高 → `gpt-5-6-thinking` + `standard`/`extended`/`max`, Pro → `gpt-5-6-pro` + `standard`. rosetta auto-aligns the field to the pinned model (`gpt-5-6-pro` → `standard`, `gpt-5-5-pro` → `extended`, others drop it) so an instant call doesn't inherit the account's Pro-default effort; pass `thinkingEffort` (CLI `--effort`, e.g. `max`) to pick a lane explicitly.
+- ChatGPT's wire shapes shift periodically. The implementation tracks the protocol as of **2026-09** (model lineup: the picker's default 即时 lane sends `gpt-5-6` with no effort field, thinking lanes use `gpt-5-6-thinking`, and the Pro lane moved to **`gpt-6-pro`** (GPT-6) — all per-tier slugs hidden from `/backend-api/models`; fresh chats carry `parent_message_id: "client-created-root"`; bootstrap SSE emits `stream_handoff`; second-leg WS uses `encoded_item` chunks; send pipeline interleaves `/conversation/init`, `/f/conversation/prepare`, `/sentinel/chat-requirements`, autocompletions, and analytics before the actual `/f/conversation` POST — observed click-to-send latency commonly 15–25 s on multi-turn Pro, so we wait for `prepare` as the "click landed" signal rather than redoing). Wire-shape regressions are caught by a captured-frame replay test.
+- **Reasoning level (`thinking_effort`)**: the 2026-09 picker is one popover (`composer-intelligence-picker-content`) with a 5-position 能力 slider plus model-family radios (最新 / GPT-5.6 Sol / GPT-5.5). Captured lane mapping (family 最新): 即时 → `gpt-5-6` (no effort field), 中/高/极高 → `gpt-5-6-thinking` + `standard`/`extended`/`max`, Pro → `gpt-6-pro` + `standard`. rosetta auto-aligns the field to the pinned model (`gpt-6-pro` → `standard`, `gpt-5-5-pro` → `extended`, others drop it — and `-pro` slugs *emit* their value even when the page omitted the field, matching the Pro lane wire) so an instant call doesn't inherit the account's thinking-lane effort; pass `thinkingEffort` (CLI `--effort`, e.g. `max`) to pick a lane explicitly.
 - **Attachments**: per-file 20 MB cap (DataTransfer payload, base64-encoded over CDP). Sequential — multiple files attach one at a time, fail-fast if any errors. Pro and instant models accept different file types (vision-only vs file-search-only); if you attach a type the current model doesn't support, the call fails with `upload-timeout` because the page never renders the chip.
 - Per-call tabs and the typing mutex assume one Chrome browser; for high concurrency consider multiple Chrome instances on different ports.
 - Soft-delete on cleanup keeps the conversation list clean; persisted recall threads opt out of soft-delete automatically.

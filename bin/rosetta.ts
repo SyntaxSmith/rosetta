@@ -4,7 +4,7 @@
  * Chrome.
  *
  * Subcommands:
- *   run "<prompt>"              one-shot, default model gpt-5-6-pro
+ *   run "<prompt>"              one-shot, default model gpt-6-pro
  *   run --model <slug> ...      explicit model slug (non-Pro tiers etc.)
  *   run --effort <level> ...    thinking_effort override (standard|extended|max)
  *   run --recall [<thread>] ... thread into a persistent named context
@@ -33,7 +33,7 @@ import {
 const HELP = `rosetta — ChatGPT (Pro) programmatic CLI
 
 Usage:
-  rosetta run "<prompt>"               one-shot, default model gpt-5-6-pro
+  rosetta run "<prompt>"               one-shot, default model gpt-6-pro
   rosetta run --model <slug> "<p>"     explicit model slug (non-Pro tiers etc.)
   rosetta run --effort <level> "<p>"   thinking_effort override (standard|extended|max)
   rosetta run --recall <thread> "<p>"  thread into a persistent context
@@ -116,8 +116,8 @@ async function cmdRun(args: string[]): Promise<void> {
   const port = Number(values.port ?? 9222);
   const host = values.host ?? "127.0.0.1";
   const model = values.pro
-    ? "gpt-5-6-pro"
-    : (values.model ?? "gpt-5-6-pro");
+    ? "gpt-6-pro"
+    : (values.model ?? "gpt-6-pro");
   const thinkingEffort = values.effort;
   const recall = values.recall;
   const stream = values.stream;
@@ -200,7 +200,7 @@ async function cmdProbe(args: string[]): Promise<void> {
       );
     }
     console.log(
-      "\n(Per-tier slugs like gpt-5-6-pro / gpt-5-6-thinking are hidden from this list;" +
+      "\n(Per-tier slugs like gpt-6-pro / gpt-5-6-thinking are hidden from this list;" +
         " pass --pro on `run`, or `-m <slug>` for a specific tier.)",
     );
   } finally {
