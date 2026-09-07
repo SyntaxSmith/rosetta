@@ -33,6 +33,7 @@
  *   ROSETTA_TIMEOUT_MS — wall-clock cap per call in ms (default 60 min, 0 disables)
  */
 
+import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -47,7 +48,20 @@ import {
 } from "../src/index.js";
 
 const SERVER_NAME = "rosetta";
-const SERVER_VERSION = "0.3.3";
+// Report the real package version in the MCP handshake instead of a drifting
+// hardcode. "../package.json" resolves when running the TS source (tsx/CLI
+// hacking); "../../package.json" resolves from the published dist/bin layout.
+function readServerVersion(): string {
+  const require = createRequire(import.meta.url);
+  for (const p of ["../package.json", "../../package.json"]) {
+    try {
+      const v = require(p) as { version?: string };
+      if (typeof v.version === "string") return v.version;
+    } catch { /* try next layout */ }
+  }
+  return "0.0.0";
+}
+const SERVER_VERSION = readServerVersion();
 
 const port = Number(process.env["ROSETTA_CDP_PORT"] ?? 9222);
 const host = process.env["ROSETTA_CDP_HOST"] ?? "127.0.0.1";
