@@ -51,6 +51,10 @@ export interface ChromeClient {
     }): Promise<void>;
     getCookies(params: { urls: string[] }): Promise<{ cookies: Array<{ name: string; value: string }> }>;
     getResponseBody(params: { requestId: string }): Promise<{ body: string; base64Encoded: boolean }>;
+    streamResourceContent(params: { requestId: string }): Promise<{ bufferedData: string }>;
+    dataReceived(
+      handler: (event: { requestId: string; data?: string }) => void,
+    ): () => void;
     requestWillBeSent(
       handler: (event: { requestId: string; request: { url: string } }) => void,
     ): () => void;

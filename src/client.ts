@@ -21,6 +21,11 @@ import type {
 } from "./types.js";
 import { appendFileSync as __dbgAppend, openSync as __dbgOpen, writeSync as __dbgWrite } from "node:fs";
 import { attachFiles, RosettaUploadError } from "./upload.js";
+import {
+  COMPOSER_EDITOR_SELECTOR,
+  SEND_BUTTON_SELECTOR,
+  STOP_BUTTON_SELECTOR,
+} from "./composer.constants.js";
 
 const DBG = !!process.env["ROSETTA_DEBUG"];
 const DBG_LOG = process.env["ROSETTA_DEBUG_LOG"];
@@ -227,7 +232,8 @@ export async function runWithNamedThreadPersistence(
   return result;
 }
 
-async function runConversationInTab(
+/** @internal Exported for response-transport regression tests. */
+export async function runConversationInTab(
   session: RosettaSession,
   client: ChromeClient,
   input: RunConversationInput,
@@ -271,8 +277,8 @@ async function runConversationInTab(
   // Only intercept at the Request stage — we let the response flow back to
   // the page naturally so React's send-action state machine actually
   // observes the SSE stream and clears itself. We capture our own copy via
-  // Network.responseReceived + Network.getResponseBody after loadingFinished;
-  // it's not live-streamed but it lets the page recover for the next turn.
+  // Network.streamResourceContent. The current page aborts bootstrap SSE after
+  // stream_handoff, so waiting for getResponseBody would lose that response.
   //
   // We intercept two URLs:
   //   - `/backend-api/f/conversation`         — the actual send (rewrite + claim)
@@ -325,6 +331,16 @@ async function runConversationInTab(
   let networkRequestId: string | undefined;
   let observedStatus: number | undefined;
   let observedContentType = "";
+  const bootstrapChunks: Buffer[] = [];
+  let responseCapture: Promise<void> | undefined;
+  let responseProcessingStarted = false;
+  let completedInstantResult: RunConversationResult | undefined;
+
+  const onDataReceived = (e: { requestId: string; data?: string }) => {
+    if (e.requestId === networkRequestId && e.data) {
+      bootstrapChunks.push(Buffer.from(e.data, "base64"));
+    }
+  };
 
   const onNetworkRequestWillBeSent = (e: {
     requestId: string;
@@ -485,14 +501,30 @@ async function runConversationInTab(
           "body rewrite (model / conversation pinning skipped for this turn).\n",
       );
     }
+    if (observedStatus >= 200 && observedStatus < 300 &&
+        observedContentType === "text/event-stream") {
+      responseCapture = (async () => {
+        const r = await Network.streamResourceContent({ requestId: e.requestId });
+        // dataReceived can arrive before the command reply. Prepend the
+        // buffered prefix, and decode only after joining bytes so a split UTF-8
+        // character survives CDP chunk boundaries.
+        bootstrapChunks.unshift(Buffer.from(r.bufferedData, "base64"));
+      })();
+      responseCapture.catch(rejectResult);
+    }
   };
-  const onLoadingFinished = async (e: { requestId: string }) => {
-    if (e.requestId !== networkRequestId) return;
+  const processResponse = async (requestId: string) => {
+    if (responseProcessingStarted) return;
+    responseProcessingStarted = true;
     try {
-      const r = await Network.getResponseBody({ requestId: e.requestId });
-      const text = r.base64Encoded
-        ? Buffer.from(r.body, "base64").toString("utf8")
-        : r.body;
+      await responseCapture;
+      let text: string;
+      if (responseCapture) {
+        text = Buffer.concat(bootstrapChunks).toString("utf8");
+      } else {
+        const r = await Network.getResponseBody({ requestId });
+        text = r.base64Encoded ? Buffer.from(r.body, "base64").toString("utf8") : r.body;
+      }
       const status = observedStatus ?? 0;
       if (status < 200 || status >= 300) {
         rejectResult(
@@ -535,15 +567,46 @@ async function runConversationInTab(
         return;
       }
       const events = parseConversationSse(stringStream(text));
-      const result = await aggregateAssistantMessage(events, startedAt);
+      const result = completedInstantResult ?? await aggregateAssistantMessage(events, startedAt);
       resolveResult(result);
     } catch (err) {
       rejectResult(err);
     }
   };
-  const onLoadingFailed = (e: { requestId: string; errorText: string }) => {
+  const onLoadingFinished = async (e: { requestId: string }) => {
+    if (e.requestId === networkRequestId) await processResponse(e.requestId);
+  };
+  const onLoadingFailed = async (e: { requestId: string; errorText: string }) => {
     if (e.requestId !== networkRequestId) return;
     dbg("Network.loadingFailed", { err: e.errorText });
+    try {
+      await responseCapture;
+      const text = Buffer.concat(bootstrapChunks).toString("utf8");
+      // The page cancels SSE after a WS handoff or the instant stream's [DONE].
+      // Recover only an explicit handoff or a complete terminal instant answer;
+      // ordinary failures still reject, and Pro still verifies via REST.
+      if (e.errorText === "net::ERR_ABORTED" &&
+          observedStatus !== undefined && observedStatus >= 200 && observedStatus < 300) {
+        if (extractStreamHandoff(text)) {
+          dbg("bootstrap aborted after stream_handoff — following second leg");
+          await processResponse(e.requestId);
+          return;
+        }
+        if (!/-pro$/.test(input.model) && /^data:\s*\[DONE\]\s*$/m.test(text)) {
+          const result = await aggregateAssistantMessage(parseConversationSse(stringStream(text)), startedAt);
+          if (result.conversationId && result.messageId && !/-pro$/.test(result.modelSlug ?? "") &&
+              (result.finishReason === "stop" || result.finishReason === "finished_successfully")) {
+            completedInstantResult = result;
+            dbg("instant SSE aborted after completed answer — returning captured response");
+            await processResponse(e.requestId);
+            return;
+          }
+        }
+      }
+    } catch (err) {
+      rejectResult(err);
+      return;
+    }
     rejectResult(
       new RosettaRequestError(
         `Network loading failed: ${e.errorText}`,
@@ -561,6 +624,7 @@ async function runConversationInTab(
     Fetch.requestPaused(onPaused) as unknown as () => void,
     Network.requestWillBeSent(onNetworkRequestWillBeSent) as unknown as () => void,
     Network.responseReceived(onResponseReceived) as unknown as () => void,
+    Network.dataReceived(onDataReceived) as unknown as () => void,
     Network.loadingFinished(onLoadingFinished) as unknown as () => void,
     Network.loadingFailed(onLoadingFailed) as unknown as () => void,
   ];
@@ -738,7 +802,7 @@ async function navigateToFreshChat(client: RosettaSession["client"]): Promise<vo
   while (Date.now() < deadline) {
     const r = await Runtime.evaluate({
       expression: `(() => {
-        const ce = document.querySelector('div#prompt-textarea, [contenteditable="true"]');
+        const ce = document.querySelector(${JSON.stringify(COMPOSER_EDITOR_SELECTOR)});
         const ta = document.querySelector('textarea');
         if (!ce && !ta) return { ready: false };
         const text = (ce?.innerText || ta?.value || "").trim();
@@ -790,7 +854,7 @@ async function withFreshTab<T>(
       port: session.meta.cdpPort,
       host: session.meta.cdpHost ?? "127.0.0.1",
       target: targetId,
-    })) as ChromeClient;
+    })) as unknown as ChromeClient;
     // Wait for first load so the composer mount race is mostly resolved
     // before runConversationInTab kicks in.
     await tabClient.Page.enable();
@@ -941,9 +1005,9 @@ async function isStopButtonVisible(
 ): Promise<boolean> {
   const r = await client.Runtime.evaluate({
     expression: `(() => {
-      const btn = document.querySelector('button[data-testid="stop-button"]') ||
+      const btn = document.querySelector(${JSON.stringify(STOP_BUTTON_SELECTOR)}) ||
         Array.from(document.querySelectorAll('button[aria-label]'))
-          .find(b => /^stop /i.test(b.getAttribute('aria-label') || ''));
+          .find(b => /^stop(?: |$)/i.test(b.getAttribute('aria-label') || ''));
       return !!btn;
     })()`,
     returnByValue: true,
@@ -1007,7 +1071,7 @@ async function driveComposerSendInner(
     await Page.bringToFront().catch(() => undefined);
     const r = await Runtime.evaluate({
       expression: `(() => {
-        const ce = document.querySelector('div#prompt-textarea, [contenteditable="true"]');
+        const ce = document.querySelector(${JSON.stringify(COMPOSER_EDITOR_SELECTOR)});
         const ta = document.querySelector('textarea');
         const target = ce || ta;
         if (target) { target.focus(); try { target.click(); } catch (_e) {} }
@@ -1031,6 +1095,22 @@ async function driveComposerSendInner(
     );
   }
   // Now insertText reliably lands.
+  // Fresh routes can restore an unsent draft in the redesigned composer.
+  // Replace that editor's contents rather than appending our prompt to it.
+  await Runtime.evaluate({
+    expression: `(() => {
+      const ce = document.querySelector(${JSON.stringify(COMPOSER_EDITOR_SELECTOR)});
+      if (ce) {
+        const range = document.createRange();
+        range.selectNodeContents(ce);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } else {
+        document.querySelector('textarea')?.select();
+      }
+    })()`,
+  });
   await Input.insertText({ text: promptText });
   dbg("Input.insertText done");
   // Verify; if not received, escalate to paste then textContent.
@@ -1040,7 +1120,7 @@ async function driveComposerSendInner(
   while (Date.now() < verifyDeadline) {
     const r = await Runtime.evaluate({
       expression: `(() => {
-        const ce = document.querySelector('div#prompt-textarea, [contenteditable="true"]');
+        const ce = document.querySelector(${JSON.stringify(COMPOSER_EDITOR_SELECTOR)});
         const ta = document.querySelector('textarea');
         return (ce?.innerText || ta?.value || "");
       })()`,
@@ -1055,7 +1135,7 @@ async function driveComposerSendInner(
     dbg("escalate to paste fallback");
     await Runtime.evaluate({
       expression: `(() => {
-        const ce = document.querySelector('div#prompt-textarea, [contenteditable="true"]');
+        const ce = document.querySelector(${JSON.stringify(COMPOSER_EDITOR_SELECTOR)});
         const ta = document.querySelector('textarea');
         const target = ce || ta;
         if (!target) return;
@@ -1072,7 +1152,7 @@ async function driveComposerSendInner(
     while (Date.now() < verifyDeadline2) {
       const r = await Runtime.evaluate({
         expression: `(() => {
-          const ce = document.querySelector('div#prompt-textarea, [contenteditable="true"]');
+          const ce = document.querySelector(${JSON.stringify(COMPOSER_EDITOR_SELECTOR)});
           const ta = document.querySelector('textarea');
           return (ce?.innerText || ta?.value || "");
         })()`,
@@ -1088,7 +1168,7 @@ async function driveComposerSendInner(
     dbg("escalate to textContent fallback");
     await Runtime.evaluate({
       expression: `(() => {
-        const ce = document.querySelector('div#prompt-textarea, [contenteditable="true"]');
+        const ce = document.querySelector(${JSON.stringify(COMPOSER_EDITOR_SELECTOR)});
         const ta = document.querySelector('textarea');
         if (ce) {
           ce.textContent = ${promptLiteral};
@@ -1116,7 +1196,7 @@ async function driveComposerSendInner(
     const r = await Runtime.evaluate({
       expression: `(() => {
         const sendBtn =
-          document.querySelector('button[data-testid="send-button"]') ||
+          document.querySelector(${JSON.stringify(SEND_BUTTON_SELECTOR)}) ||
           Array.from(document.querySelectorAll('button[aria-label]'))
             .find(b => /send/i.test(b.getAttribute('aria-label') || ''));
         if (!sendBtn) return { state: "no-button" };

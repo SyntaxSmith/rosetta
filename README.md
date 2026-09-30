@@ -337,6 +337,12 @@ If you're hacking on rosetta itself, point the host at the source instead of the
 
 Run `pnpm build` in the rosetta repo first so `dist/` exists.
 
+To test the current frontend through CDP 9222, run `node scripts/frontend-smoke.mjs`
+after building. It uploads a text file to Pro, adds a Markdown file in the same
+conversation, and sends a PNG to the instant model. It checks file-only random
+tokens, image color, model slugs, and the actual sent prompts, writes receipts
+to a temporary directory, and hides its completed test conversations.
+
 ### Common gotchas
 
 - **Chrome must be running** with `--remote-debugging-port=<ROSETTA_CDP_PORT>` *before* the host invokes the tool. Hosts spawn the MCP server lazily; the server fails fast with a clear `auth error [not-logged-in]` if Chrome isn't there.
@@ -345,6 +351,9 @@ Run `pnpm build` in the rosetta repo first so `dist/` exists.
 
 ## Caveats
 
+- **Composer (2026-09-30)**: the editor now sits in `form[data-chatgpt-composer]` without a `prompt-textarea` ID. Send is the form's `button[type="submit"]`; the Chinese stop control is labelled `停止`. Sending and attachment readiness share the send selector. Restored unsent drafts are replaced before inserting the caller's prompt.
+- **SSE cancellation (2026-09-30)**: the page cancels SSE after `stream_handoff` or an instant answer's `[DONE]`, producing `net::ERR_ABORTED` even on HTTP 200. Rosetta captures the bytes with CDP `Network.streamResourceContent` before cancellation, follows Pro handoffs, and accepts completed instant answers with a terminal finish state. Incomplete aborts remain errors; Pro final answers still require conversation-mapping verification.
+- **File-picker preflight (2026-09-30)**: an upload `onChange` handler can exist before the page accepts files. Rosetta waits for the input's native React picker preflight to accept selection and initialize its context, then sets files via CDP and waits for the named chip and enabled send control. Image tiles expose their filenames in `aria-label`/`alt`, which count alongside visible chip text.
 - ChatGPT's wire shapes shift periodically. The implementation tracks the protocol as of **2026-09** (model lineup: the picker's default 即时 lane sends `gpt-5-6` with no effort field, thinking lanes use `gpt-5-6-thinking`, and the Pro lane moved to **`gpt-6-pro`** (GPT-6) — all per-tier slugs hidden from `/backend-api/models`; fresh chats carry `parent_message_id: "client-created-root"`; bootstrap SSE emits `stream_handoff`; second-leg WS uses `encoded_item` chunks; send pipeline interleaves `/conversation/init`, `/f/conversation/prepare`, `/sentinel/chat-requirements`, autocompletions, and analytics before the actual `/f/conversation` POST — observed click-to-send latency commonly 15–25 s on multi-turn Pro, so we wait for `prepare` as the "click landed" signal rather than redoing). Wire-shape regressions are caught by a captured-frame replay test.
 - **Reasoning level (`thinking_effort`)**: the 2026-09 picker is one popover (`composer-intelligence-picker-content`) with a 5-position 能力 slider plus model-family radios (最新 / GPT-5.6 Sol / GPT-5.5). Captured lane mapping (family 最新): 即时 → `gpt-5-6` (no effort field), 中/高/极高 → `gpt-5-6-thinking` + `standard`/`extended`/`max`, Pro → `gpt-6-pro` + `standard`. rosetta auto-aligns the field to the pinned model (`gpt-6-pro` → `standard`, `gpt-5-5-pro` → `extended`, others drop it — and `-pro` slugs *emit* their value even when the page omitted the field, matching the Pro lane wire) so an instant call doesn't inherit the account's thinking-lane effort; pass `thinkingEffort` (CLI `--effort`, e.g. `max`) to pick a lane explicitly.
 - **Attachments**: per-file 20 MB cap (DataTransfer payload, base64-encoded over CDP). Sequential — multiple files attach one at a time, fail-fast if any errors. Pro and instant models accept different file types (vision-only vs file-search-only); if you attach a type the current model doesn't support, the call fails with `upload-timeout` because the page never renders the chip.

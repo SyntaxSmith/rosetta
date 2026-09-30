@@ -10,6 +10,7 @@ import {
   guessMimeType,
   transferAttachmentViaDataTransfer,
   waitForAttachmentReady,
+  waitForComposerUploadReady,
 } from "../src/upload.js";
 
 let tempDir: string;
@@ -167,6 +168,74 @@ describe("transferAttachmentViaDataTransfer", () => {
 });
 
 describe("production DOM.setFileInputFiles path", () => {
+  test("recognizes an image tile named only by alt after it finishes uploading", async () => {
+    vi.useFakeTimers();
+    class Tile {
+      textContent = "";
+      disabled = false;
+      constructor(public attrs: Record<string, string> = {}) {}
+      getBoundingClientRect() { return { width: 96, height: 96 }; }
+      getAttribute(name: string) { return this.attrs[name] ?? null; }
+    }
+    const image = new Tile({ alt: "blue-square(1).png" });
+    const send = new Tile();
+    send.disabled = true;
+    const document = {
+      querySelector: () => send,
+      querySelectorAll: (selector: string) => selector.includes(",img") ? [image] : [],
+    };
+    const runtime = {
+      async enable() {},
+      async evaluate({ expression }: CapturedEval) {
+        const evaluate = new Function("document", "HTMLElement", `return ${expression}`);
+        return { result: { value: evaluate(document, Tile) } };
+      },
+    };
+    let ready = false;
+    const pending = waitForAttachmentReady(runtime, { path: "/tmp/blue-square.png" }, "blue-square.png", 4_000)
+      .then(() => { ready = true; });
+    await vi.advanceTimersByTimeAsync(1_250);
+    expect(ready).toBe(false);
+    send.disabled = false;
+    await vi.advanceTimersByTimeAsync(1_250);
+    await pending;
+    expect(ready).toBe(true);
+  });
+
+  test("waits for the native picker preflight to accept files after onChange mounts", async () => {
+    vi.useFakeTimers();
+    let eligible = false;
+    let selections = 0;
+    const input = {
+      parentElement: null,
+      __reactProps$fixture: {
+        onChange() {},
+        onClick(event: { preventDefault(): void }) {
+          if (!eligible) event.preventDefault();
+          else selections++;
+        },
+      },
+    };
+    class PickerEvent {
+      defaultPrevented = false;
+      preventDefault() { this.defaultPrevented = true; }
+    }
+    const runtime = {
+      async enable() {},
+      async evaluate({ expression }: CapturedEval) {
+        const evaluate = new Function("document", "MouseEvent", `return ${expression}`);
+        return { result: { value: evaluate({ querySelector: () => input }, PickerEvent) } };
+      },
+    };
+    const pending = waitForComposerUploadReady(runtime, 'input[type="file"]', 1_000);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(selections).toBe(0);
+    eligible = true;
+    await vi.advanceTimersByTimeAsync(150);
+    await expect(pending).resolves.toBe(true);
+    expect(selections).toBe(1);
+  });
+
   test("findFileInputSelector marks and returns one exact scored input", async () => {
     const exactSelector = '[data-rosetta-file-input="rosetta-test"]';
     const { runtime, captures } = makeStubRuntime(() => exactSelector);
@@ -270,12 +339,14 @@ describe("production DOM.setFileInputFiles path", () => {
     const fixturePath = path.join(tempDir, "not-ready.txt");
     writeFileSync(fixturePath, "not ready");
     const exactSelector = '[data-rosetta-file-input="rosetta-not-ready"]';
+    let handlerPolled = false;
 
     const runtime = {
       async evaluate(params: CapturedEval) {
         if (params.expression.includes("const selectors =")) {
           return { result: { value: exactSelector } };
         }
+        handlerPolled = true;
         return { result: { value: false } };
       },
     };
@@ -294,6 +365,9 @@ describe("production DOM.setFileInputFiles path", () => {
       retryable: true,
     });
 
+    // attachFiles awaits real filesystem I/O before starting its fake-clock
+    // readiness deadline. Wait for that phase before advancing the full timeout.
+    await vi.waitFor(() => expect(handlerPolled).toBe(true));
     await vi.advanceTimersByTimeAsync(16_000);
     await rejection;
     expect(setFileInputFiles).not.toHaveBeenCalled();

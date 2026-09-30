@@ -1,0 +1,130 @@
+{
+  "date": "2026-09-30",
+  "version": "0.4.2",
+  "cdpPort": 9222,
+  "fixes": [
+    "composer editor and send/stop selectors",
+    "file-picker eligibility and selection preflight",
+    "image filenames in aria-label and alt",
+    "SSE byte capture before frontend cancellation",
+    "complete instant SSE versus Pro stream handoff",
+    "replacement of restored composer drafts"
+  ],
+  "checks": {
+    "typecheck": "passed",
+    "build": "passed",
+    "unitTests": {
+      "passed": 65,
+      "failed": 0
+    }
+  },
+  "liveTests": [
+    {
+      "name": "pro-text-attachment",
+      "requestedModel": "gpt-6-pro",
+      "returnedModel": "gpt-6-pro",
+      "text": "DOC-a550dc34c1e89de2",
+      "expected": [
+        "DOC-a550dc34c1e89de2"
+      ],
+      "actualPrompt": "Read the attached text file. Reply with only the verification token written in the file.",
+      "passed": true,
+      "tookMs": 37518,
+      "conversationId": "6abd156c-5478-83ea-b55c-b941a2218dae",
+      "messageId": "22b7c5f3-5989-47e0-87ff-c577f4cf2098",
+      "attachments": [
+        "first-upload.txt"
+      ],
+      "messageAttachments": [
+        "first-upload(1).txt"
+      ]
+    },
+    {
+      "name": "pro-followup-attachment",
+      "requestedModel": "gpt-6-pro",
+      "returnedModel": "gpt-6-pro",
+      "text": "DOC-a550dc34c1e89de2 NEXT-f330e67a82096c50",
+      "expected": [
+        "DOC-a550dc34c1e89de2",
+        "NEXT-f330e67a82096c50"
+      ],
+      "actualPrompt": "Read the new attached Markdown file. Reply with the verification token from the first file and the second token from the new file, separated by one space.",
+      "passed": true,
+      "tookMs": 31347,
+      "conversationId": "6abd156c-5478-83ea-b55c-b941a2218dae",
+      "messageId": "f94113c0-aa46-4b6f-a8d2-40f417e9a2ac",
+      "attachments": [
+        "followup-upload.md"
+      ],
+      "messageAttachments": [
+        "followup-upload.md"
+      ]
+    },
+    {
+      "name": "installed-mcp-multiple-files",
+      "serverVersion": "0.4.2",
+      "text": "MCP-A-464484f5be3e89b8 MCP-B-ba0418595b145c05",
+      "conversationId": "6abd1953-0488-83ea-93fc-0bf903a94c7f",
+      "messageId": "6e6a7420-90c1-4f16-9a9b-7458041d194f",
+      "modelSlug": "gpt-6-pro",
+      "finishReason": "",
+      "tookMs": 41311,
+      "eventCount": 1,
+      "serverPid": 29180,
+      "threadKind": "session",
+      "expected": [
+        "MCP-A-464484f5be3e89b8",
+        "MCP-B-ba0418595b145c05"
+      ],
+      "passed": true,
+      "attachments": [
+        "mcp-first.txt",
+        "mcp-second.txt"
+      ]
+    },
+    {
+      "name": "installed-mcp-default-continuation",
+      "serverVersion": "0.4.2",
+      "text": "MCP-A-464484f5be3e89b8 MCP-B-ba0418595b145c05",
+      "conversationId": "6abd1953-0488-83ea-93fc-0bf903a94c7f",
+      "messageId": "1bf3c060-eda2-4d75-b6f2-f5f38cb1ad9e",
+      "modelSlug": "gpt-6-pro",
+      "finishReason": "",
+      "tookMs": 22094,
+      "eventCount": 1,
+      "serverPid": 29180,
+      "threadKind": "session",
+      "expected": [
+        "MCP-A-464484f5be3e89b8",
+        "MCP-B-ba0418595b145c05"
+      ],
+      "passed": true,
+      "attachments": []
+    },
+    {
+      "name": "installed-package-image-attachment",
+      "serverVersion": "0.4.2",
+      "text": "blue",
+      "conversationId": "6abd19f8-4768-83ea-9442-b89519006c44",
+      "messageId": "fff97023-e1b5-4805-9c1f-2bb480a49c8b",
+      "modelSlug": "gpt-5-6",
+      "finishReason": "stop",
+      "tookMs": 13756,
+      "eventCount": 29,
+      "attachments": [
+        "image-upload.png"
+      ],
+      "expected": [
+        "blue"
+      ],
+      "passed": true
+    }
+  ],
+  "installation": {
+    "package": "/opt/homebrew/lib/node_modules/@syntaxsmith/rosetta",
+    "codexCommand": "/opt/homebrew/bin/rosetta-mcp",
+    "claudeCommand": "/opt/homebrew/bin/rosetta-mcp",
+    "mcpHandshakeVersion": "0.4.2"
+  },
+  "note": "The two initial API checks preceded the final instant-SSE completion fix. The installed MCP revalidated Pro multi-file upload and implicit continuation; the installed package also passed the image check with a filename that does not reveal the color."
+}

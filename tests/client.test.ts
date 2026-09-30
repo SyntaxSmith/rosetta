@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   pollConversationForFinal,
   RosettaRequestError,
+  runConversationInTab,
   runWithNamedThreadPersistence,
   streamSecondLeg,
 } from "../src/client.js";
@@ -284,6 +285,124 @@ describe("Pro stream-to-REST completion gate", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("bootstrap SSE capture", () => {
+  function bootstrapHarness(text: string, failed: boolean, model = "gpt-6-pro") {
+    const handlers: Record<string, (event: any) => unknown> = {};
+    const subscribe = (name: string) => (handler: (event: any) => unknown) => {
+      handlers[name] = handler;
+      return () => { delete handlers[name]; };
+    };
+    const bytes = Buffer.from(text);
+    const textOffset = bytes.indexOf(Buffer.from("完整"));
+    const split = textOffset < 0 ? 17 : textOffset + 1;
+    const Network = {
+      enable: vi.fn(async () => undefined),
+      requestWillBeSent: subscribe("request"),
+      responseReceived: subscribe("response"),
+      dataReceived: subscribe("data"),
+      loadingFinished: subscribe("finished"),
+      loadingFailed: subscribe("failed"),
+      getResponseBody: vi.fn(async () => { throw new Error("aborted response body is unavailable"); }),
+      streamResourceContent: vi.fn(async () => {
+        // CDP can deliver live data before the buffered-prefix command reply.
+        handlers.data?.({ requestId: "bootstrap", data: bytes.subarray(split).toString("base64") });
+        queueMicrotask(() => {
+          handlers[failed ? "failed" : "finished"]?.({
+            requestId: "bootstrap", errorText: "net::ERR_ABORTED",
+          });
+        });
+        return { bufferedData: bytes.subarray(0, split).toString("base64") };
+      }),
+    };
+    const Fetch = {
+      enable: vi.fn(async () => undefined),
+      disable: vi.fn(async () => undefined),
+      requestPaused: subscribe("paused"),
+      continueRequest: vi.fn(async () => {
+        handlers.request?.({ requestId: "bootstrap", request: { url: "https://chatgpt.com/backend-api/f/conversation" } });
+        handlers.response?.({ requestId: "bootstrap", response: { status: 200, mimeType: "text/event-stream" } });
+      }),
+    };
+    const client = {
+      Network, Fetch,
+      Page: {
+        enable: vi.fn(async () => undefined),
+        navigate: vi.fn(async () => ({ frameId: "frame" })),
+        loadEventFired: vi.fn(async () => ({ timestamp: 0 })),
+        bringToFront: vi.fn(async () => undefined),
+      },
+      Input: { insertText: vi.fn(async () => undefined) },
+      Runtime: {
+        enable: vi.fn(async () => undefined),
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          if (expression.includes("document.hasFocus")) return { result: { value: true } };
+          if (expression.includes("sendBtn.click")) {
+            handlers.paused?.({ requestId: "fetch-bootstrap", request: {
+              url: "https://chatgpt.com/backend-api/f/conversation",
+              postData: JSON.stringify({ model: "gpt-5-6", messages: [] }), headers: {},
+            } });
+            return { result: { value: { state: "clicked" } } };
+          }
+          return { result: { value: "test prompt" } };
+        }),
+      },
+    } as unknown as ChromeClient;
+    const session = {
+      client, meta: { accessToken: "test-token" },
+      httpRequest: vi.fn(async (input: { url: string }) => {
+        if (input.url === "/backend-api/celsius/ws/user") return response(503, {});
+        return response(200, { mapping: finalMapping() });
+      }),
+    } as unknown as RosettaSession;
+    const run = () => runConversationInTab(session, client, {
+      prompt: "test prompt", model, conversationId: HANDOFF.conversationId,
+    }, { timeoutMs: 1_000, keepConversation: true });
+    return { run, Network, session };
+  }
+
+  test("a captured handoff survives the page abort and still verifies the final turn", async () => {
+    const text = `data: ${JSON.stringify({ type: "stream_handoff",
+      conversation_id: HANDOFF.conversationId, turn_exchange_id: TURN_ID,
+      options: [{ type: "subscribe_ws_topic", topic_id: HANDOFF.topicId }],
+    })}\n\ndata: [DONE]\n\n`;
+    const harness = bootstrapHarness(text, true);
+    await expect(harness.run()).resolves.toMatchObject({ text: "完整最终回答", messageId: "final-text-message" });
+    expect(harness.Network.getResponseBody).not.toHaveBeenCalled();
+    expect(harness.session.httpRequest).toHaveBeenCalledWith(expect.objectContaining({
+      url: `/backend-api/conversation/${HANDOFF.conversationId}`,
+    }));
+  });
+
+  test("an abort without a handoff remains a network error", async () => {
+    const harness = bootstrapHarness('data: {"type":"keepalive"}\n\n', true);
+    await expect(harness.run()).rejects.toThrow("Network loading failed: net::ERR_ABORTED");
+    expect(harness.session.httpRequest).not.toHaveBeenCalled();
+  });
+
+  test.each([false, true])("instant SSE preserves UTF-8 on completion (page aborted: %s)", async (failed) => {
+    const message = finalMapping().final!.message!;
+    const text = `data: ${JSON.stringify({ conversation_id: HANDOFF.conversationId,
+      message: { ...message, metadata: { ...message.metadata, model_slug: "gpt-5-6" } },
+    })}\n\ndata: [DONE]\n\n`;
+    const harness = bootstrapHarness(text, failed, "gpt-5-6");
+    await expect(harness.run()).resolves.toMatchObject({ text: "完整最终回答" });
+    expect(harness.Network.getResponseBody).not.toHaveBeenCalled();
+  });
+
+  test("[DONE] without a terminal instant assistant answer cannot recover an abort", async () => {
+    const harness = bootstrapHarness("data: [DONE]\n\n", true, "gpt-5-6");
+    await expect(harness.run()).rejects.toThrow("Network loading failed: net::ERR_ABORTED");
+  });
+
+  test("Pro text plus [DONE] cannot bypass the handoff and final-state verifier", async () => {
+    const text = `data: ${JSON.stringify({ conversation_id: HANDOFF.conversationId,
+      message: finalMapping().final!.message,
+    })}\n\ndata: [DONE]\n\n`;
+    const harness = bootstrapHarness(text, true);
+    await expect(harness.run()).rejects.toThrow("Network loading failed: net::ERR_ABORTED");
   });
 });
 

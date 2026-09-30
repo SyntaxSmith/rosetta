@@ -3,6 +3,7 @@ import path from "node:path";
 import type { ChromeClient } from "./chrome.js";
 import type { Attachment } from "./types.js";
 import { FILE_INPUT_SELECTORS, UPLOAD_STATUS_SELECTORS } from "./upload.constants.js";
+import { SEND_BUTTON_SELECTOR } from "./composer.constants.js";
 
 /** Soft cap on per-file size for in-page DataTransfer injection (20 MB raw). */
 export const MAX_DATA_TRANSFER_BYTES = 20 * 1024 * 1024;
@@ -283,13 +284,16 @@ export async function waitForAttachmentReady(
     const root = input?.closest('form') || input?.parentElement?.parentElement || document;
     // Match the full filename, or the stem when it's distinctive enough that a
     // truncated chip ("my-long-na…") won't false-match generic UI text.
-    const candidates = Array.from(root.querySelectorAll('div,span,button,a,p,li,h1,h2,h3'));
+    const candidates = Array.from(root.querySelectorAll('div,span,button,a,p,li,h1,h2,h3,img'));
     let chipNamed = false;
     for (const el of candidates) {
       if (!(el instanceof HTMLElement)) continue;
       const rect = el.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) continue;
-      const text = (el.textContent || '').toLowerCase().trim();
+      // Image tiles expose filenames through accessible names rather than
+      // visible text in the September 2026 composer.
+      const text = [el.textContent, el.getAttribute('aria-label'), el.getAttribute('alt')]
+        .filter(Boolean).join(' ').toLowerCase().trim();
       if (!text || text.length > 256) continue;
       if (text.includes(name) || (stem.length >= 4 && text.includes(stem))) {
         chipNamed = true;
@@ -318,7 +322,7 @@ export async function waitForAttachmentReady(
       .map((node) => (node.textContent || '').trim())
       .find((text) => /upload|file|attach|unsupported|failed|could not/i.test(text));
     const sendBtn =
-      document.querySelector('button[data-testid="send-button"]') ||
+      document.querySelector(${JSON.stringify(SEND_BUTTON_SELECTOR)}) ||
       Array.from(document.querySelectorAll('button[aria-label]')).find((b) =>
         /send/i.test(b.getAttribute('aria-label') || '')
       );
@@ -379,8 +383,12 @@ export async function resolveElementObjectId(
 
 /**
  * Wait until the composer's file input (or a nearby ancestor) carries a React
- * `onChange`/`onInput` handler — the signal that ChatGPT has wired its upload
- * pipeline to the input and a `change` event will be routed to the message
+ * `onChange`/`onInput` handler and its file-picker preflight accepts selection.
+ * The September 2026 input has an onChange before its account context is ready;
+ * it clears files and returns when that gate is false. Its onClick checks the
+ * same gate and initializes the selection context. Invoke that handler without
+ * opening a native file dialog before handing files to CDP.
+ * This ensures a `change` event will be routed to the message
  * attachment flow (`POST /backend-api/files` → blob PUT → process_upload_stream)
  * rather than the `/files/library` mis-route. React stores element props on the
  * DOM node under a `__reactProps$<hash>` key; we walk a few ancestors because
@@ -403,6 +411,13 @@ export async function waitForComposerUploadReady(
       if (key) {
         const p = n[key];
         if (p && (typeof p.onChange === 'function' || typeof p.onInput === 'function')) {
+          if (n === el && typeof p.onClick === 'function') {
+            const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+            Object.defineProperty(event, 'currentTarget', { value: el });
+            Object.defineProperty(event, 'target', { value: el });
+            p.onClick(event);
+            return !event.defaultPrevented;
+          }
           return true;
         }
       }
