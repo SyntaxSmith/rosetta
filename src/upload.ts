@@ -415,8 +415,21 @@ export async function waitForComposerUploadReady(
             const event = new MouseEvent('click', { bubbles: true, cancelable: true });
             Object.defineProperty(event, 'currentTarget', { value: el });
             Object.defineProperty(event, 'target', { value: el });
-            p.onClick(event);
-            return !event.defaultPrevented;
+            // New composers explicitly preventDefault + showPicker after
+            // eligibility/preflight succeeds. CDP supplies the files instead
+            // of a native dialog; suppress only that synchronous picker call.
+            const ownPicker = Object.getOwnPropertyDescriptor(el, 'showPicker');
+            let pickerRequested = false;
+            try {
+              Object.defineProperty(el, 'showPicker', {
+                configurable: true, value: () => { pickerRequested = true; },
+              });
+              p.onClick(event);
+              return pickerRequested || !event.defaultPrevented;
+            } finally {
+              if (ownPicker) Object.defineProperty(el, 'showPicker', ownPicker);
+              else delete el.showPicker;
+            }
           }
           return true;
         }
@@ -427,6 +440,11 @@ export async function waitForComposerUploadReady(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const r = await runtime.evaluate({ expression, returnByValue: true });
+    if (r.exceptionDetails) {
+      throw new Error(
+        'Composer upload preflight threw: ' + r.exceptionDetails.text,
+      );
+    }
     if (r.result?.value === true) return true;
     await new Promise<void>((resolve) => setTimeout(resolve, 150));
   }

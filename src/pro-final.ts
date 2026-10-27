@@ -83,7 +83,9 @@ export function evaluateProTurnCompletion(
     message.content?.content_type === "reasoning_recap" &&
     message.recipient === "all" &&
     message.status === "finished_successfully" &&
-    message.end_turn === true &&
+    // The recap ends reasoning, not the turn. Since October 2026 the live
+    // frontend marks it end_turn=false; the descendant final text below must
+    // still carry end_turn=true.
     message.metadata?.reasoning_status === "reasoning_ended"
   );
   if (reasoningEnded.length === 0) {

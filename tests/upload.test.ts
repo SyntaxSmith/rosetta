@@ -236,6 +236,40 @@ describe("production DOM.setFileInputFiles path", () => {
     expect(selections).toBe(1);
   });
 
+  test("runs eligible picker preflight without opening a native dialog and restores showPicker", async () => {
+    vi.useFakeTimers();
+    let eligible = false;
+    const nativePicker = vi.fn(() => { throw new Error("user activation required"); });
+    const input = {
+      parentElement: null, showPicker: nativePicker,
+      __reactProps$fixture: {
+        onChange() {},
+        onClick(event: { preventDefault(): void; currentTarget: { showPicker(): void } }) {
+          event.preventDefault();
+          if (eligible) event.currentTarget.showPicker();
+        },
+      },
+    };
+    class PickerEvent {
+      defaultPrevented = false;
+      preventDefault() { this.defaultPrevented = true; }
+    }
+    const runtime = {
+      async evaluate({ expression }: CapturedEval) {
+        const evaluate = new Function("document", "MouseEvent", `return ${expression}`);
+        return { result: { value: evaluate({ querySelector: () => input }, PickerEvent) } };
+      },
+    };
+    const pending = waitForComposerUploadReady({ ...runtime, async enable() {} }, 'input[type="file"]', 1_000);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(input.showPicker).toBe(nativePicker);
+    eligible = true;
+    await vi.advanceTimersByTimeAsync(150);
+    await expect(pending).resolves.toBe(true);
+    expect(nativePicker).not.toHaveBeenCalled();
+    expect(input.showPicker).toBe(nativePicker);
+  });
+
   test("findFileInputSelector marks and returns one exact scored input", async () => {
     const exactSelector = '[data-rosetta-file-input="rosetta-test"]';
     const { runtime, captures } = makeStubRuntime(() => exactSelector);

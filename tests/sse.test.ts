@@ -321,6 +321,22 @@ describe("Pro turn final-state verification", () => {
     });
   });
 
+  test("accepts October recap end_turn=false only with a completed descendant final", () => {
+    const mapping: ConversationMapping = {
+      recap: assistantNode("recap", null, "reasoning_recap", {
+        reasoningStatus: "reasoning_ended", endTurn: false,
+      }),
+      final: assistantNode("final", "recap", "text", { text: "complete answer" }),
+    };
+    expect(evaluateProTurnCompletion(mapping, PRO_TURN)).toMatchObject({
+      done: true, finalText: "complete answer",
+    });
+    mapping.final!.message!.end_turn = false;
+    expect(evaluateProTurnCompletion(mapping, PRO_TURN).done).toBe(false);
+    delete mapping.final;
+    expect(evaluateProTurnCompletion(mapping, PRO_TURN).done).toBe(false);
+  });
+
   test("explicit non-stop finish_details still disqualifies the terminal text", () => {
     const mapping: ConversationMapping = {
       recap: assistantNode("recap", null, "reasoning_recap", {
