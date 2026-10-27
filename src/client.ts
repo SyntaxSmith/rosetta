@@ -1710,7 +1710,7 @@ export async function pollConversationForFinal(
     consecutiveCdpFailures = 0;
     eventCount += 1;
     if (resp.status === 200) {
-      const body = resp.body as { mapping?: ConversationMapping };
+      const body = resp.body as { mapping?: ConversationMapping; current_node?: string | null };
       const mapping = body.mapping ?? {};
 
       // Exact turn matching is mandatory. A missing turn_exchange_id is not a
@@ -1750,7 +1750,7 @@ export async function pollConversationForFinal(
         lastProgressAt = Date.now();
       }
 
-      const verification = evaluateProTurnCompletion(mapping, handoff.turnExchangeId);
+      const verification = evaluateProTurnCompletion(mapping, handoff.turnExchangeId, body.current_node);
       lastVerificationReason = verification.reason ?? "verified";
       if (
         verification.done &&

@@ -55,13 +55,16 @@ type KeyedMessage = {
  *       -> recipient=all text(finish_details.type=stop)
  *
  * We therefore require that topology and reject any candidate followed by (or
- * graph-incomparable with) an `is_reasoning` thoughts/code node from the same
- * turn. Failing closed is intentional: an unverifiable response must not be
+ * graph-incomparable with) an `is_reasoning` node from the same turn, regardless
+ * of content type. An optional current_node mapping key can select between
+ * completed branches, but cannot excuse unresolved reasoning on another branch.
+ * Failing closed is intentional: an unverifiable response must not be
  * returned or persisted as though it were the final answer.
  */
 export function evaluateProTurnCompletion(
   mapping: ConversationMapping,
   turnExchangeId: string,
+  currentNodeKey?: string | null,
 ): ProTurnCompletion {
   if (!turnExchangeId) {
     return { done: false, reason: "missing turn_exchange_id" };
@@ -122,13 +125,38 @@ export function evaluateProTurnCompletion(
   }
 
   const activeReasoning = turnMessages.filter(({ message }) =>
-    (message.content?.content_type === "thoughts" ||
-      message.content?.content_type === "code") &&
     message.metadata?.reasoning_status === "is_reasoning"
   );
 
-  const structurallySafe = afterReasoningEnded.filter((candidate) =>
-    activeReasoning.every((active) => {
+  // current_node is a selector, not completion evidence. Validate its branch
+  // and only discount historical reasoning on other independently finished
+  // branches. A stale pointer, unfinished sibling, or corrupt ancestry must
+  // not turn a progress message into a final answer.
+  const hasSelection = currentNodeKey !== undefined && currentNodeKey !== null;
+  let candidates = afterReasoningEnded;
+  if (hasSelection) {
+    if (typeof currentNodeKey !== "string" || !hasValidAncestry(mapping, currentNodeKey)) {
+      return { done: false, reason: "invalid current_node or ancestry" };
+    }
+    const completeLeaves = afterReasoningEnded.filter(({ key }) =>
+      hasValidAncestry(mapping, key) &&
+      !afterReasoningEnded.some((other) => isDescendantOf(mapping, other.key, key))
+    );
+    candidates = completeLeaves.filter(({ key }) => key === currentNodeKey);
+    if (candidates.length !== 1) {
+      return { done: false, reason: "current_node is not a verified terminal leaf for this turn" };
+    }
+    if (!activeReasoning.every((active) =>
+      active.key !== currentNodeKey &&
+      !isDescendantOf(mapping, active.key, currentNodeKey) &&
+      completeLeaves.some((leaf) => isDescendantOf(mapping, leaf.key, active.key))
+    )) {
+      return { done: false, reason: "unresolved reasoning remains on selected or sibling branch" };
+    }
+  }
+
+  const structurallySafe = candidates.filter((candidate) =>
+    hasSelection || activeReasoning.every((active) => {
       if (isDescendantOf(mapping, candidate.key, active.key)) return true;
       // Active reasoning after the candidate is a definite early-preamble
       // signature. An incomparable same-turn branch is also not proof of
@@ -175,6 +203,19 @@ export function evaluateProTurnCompletion(
     modelSlug: finalCandidate.message.metadata?.model_slug,
     finishReason: finalCandidate.message.metadata?.finish_details?.type,
   };
+}
+
+function hasValidAncestry(mapping: ConversationMapping, key: string): boolean {
+  const seen = new Set<string>();
+  let current: string | null | undefined = key;
+  while (current !== null && current !== undefined) {
+    if (!current || seen.has(current) || !Object.hasOwn(mapping, current)) return false;
+    seen.add(current);
+    const node: ConversationMappingNode | undefined = mapping[current];
+    if (!node || (node.parent != null && typeof node.parent !== "string")) return false;
+    current = node.parent;
+  }
+  return true;
 }
 
 function isDescendantOf(

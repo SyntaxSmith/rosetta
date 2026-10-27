@@ -207,6 +207,23 @@ function makeStreamHarness(
 }
 
 describe("Pro stream-to-REST completion gate", () => {
+  test("REST current_node selects a complete regenerated branch", async () => {
+    const mapping = finalMapping();
+    mapping.otherRecap = structuredClone(mapping.recap!);
+    mapping.otherFinal = structuredClone(mapping.final!);
+    mapping.otherFinal.parent = "otherRecap";
+    mapping.otherFinal.message!.id = "regenerated-answer";
+    mapping.otherFinal.message!.content!.parts = ["regenerated full answer"];
+    const harness = makeStreamHarness("final-text", mapping);
+    harness.conversationGets.mockImplementation(async () =>
+      response(200, { mapping, current_node: "otherFinal" })
+    );
+    const result = await pollConversationForFinal(
+      harness.session, HANDOFF, Date.now(), undefined, 0, undefined,
+    );
+    expect(result).toMatchObject({ text: "regenerated full answer", messageId: "regenerated-answer" });
+  });
+
   test("B: message_stream_complete still polls and rejects when the turn remains in reasoning", async () => {
     const harness = makeStreamHarness("message-complete", activeMapping(), true);
 
